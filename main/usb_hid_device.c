@@ -12,7 +12,7 @@ static const char *TAG = "usb_hid_device";
 
 #define USB_HID_REPORT_ID_KEYBOARD 1
 #define USB_HID_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_HID * TUD_HID_DESC_LEN)
-#define USB_HID_READY_TIMEOUT_MS 1000
+#define USB_HID_READY_TIMEOUT_MS 2000
 #define USB_HID_RELEASE_POLL_MS 5
 
 static bool s_installed;
@@ -84,6 +84,11 @@ esp_err_t usb_hid_device_init(void)
     if (s_installed) return ESP_OK;
 
     tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+    
+    /* Manual task configuration to isolate USB from Network traffic */
+    tusb_cfg.task.priority = 20;     /* High priority */
+    tusb_cfg.task.xCoreID = 1;       /* Run on Core 1 (Network is on Core 0) */
+    
     tusb_cfg.descriptor.device = NULL;
     tusb_cfg.descriptor.full_speed_config = s_hid_configuration_descriptor;
     tusb_cfg.descriptor.string = s_hid_string_descriptor;
@@ -122,8 +127,13 @@ static esp_err_t wait_hid_ready(void)
 
     uint32_t waited = 0;
     while (!tud_hid_ready() && waited < USB_HID_READY_TIMEOUT_MS) {
-        vTaskDelay(pdMS_TO_TICKS(5));
-        waited += 5;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        waited += 10;
+    }
+    
+    if (!tud_hid_ready()) {
+        ESP_LOGW(TAG, "HID timeout: mounted=%d, suspended=%d, ready=%d", 
+                 tud_mounted(), s_suspended, tud_hid_ready());
     }
     return tud_hid_ready() ? ESP_OK : ESP_ERR_TIMEOUT;
 }
@@ -159,7 +169,18 @@ esp_err_t usb_hid_device_release_best_effort(uint32_t timeout_ms)
 
 esp_err_t usb_hid_device_press(uint8_t modifier, uint8_t keycode)
 {
-    ESP_RETURN_ON_ERROR(wait_hid_ready(), TAG, "HID is not ready");
+    /* Use a shorter polling interval to check readiness more frequently without long blocking */
+    uint32_t waited = 0;
+    while (!tud_hid_ready() && waited < USB_HID_READY_TIMEOUT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(2)); 
+        waited += 2;
+    }
+
+    if (!tud_hid_ready()) {
+        ESP_LOGE(TAG, "HID press timeout (busy/suspended). Mounted=%d", tud_mounted());
+        return ESP_ERR_TIMEOUT;
+    }
+
     uint8_t keycodes[6] = {keycode, 0, 0, 0, 0, 0};
     if (!tud_hid_keyboard_report(USB_HID_REPORT_ID_KEYBOARD, modifier, keycodes)) {
         return ESP_FAIL;

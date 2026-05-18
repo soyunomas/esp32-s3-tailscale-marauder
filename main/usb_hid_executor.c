@@ -16,9 +16,9 @@
 #define USB_HID_EXEC_TASK_STACK 4096
 #define USB_HID_EXEC_MAX_RUNTIME_MS 60000
 #define USB_HID_EXEC_MAX_DELAY_MS 10000
-#define USB_HID_EXEC_DEFAULT_STEP_MS 1
-#define USB_HID_EXEC_KEY_PRESS_MS 20
-#define USB_HID_EXEC_KEY_RELEASE_SETTLE_MS 10
+#define USB_HID_EXEC_DEFAULT_STEP_MS 5
+#define USB_HID_EXEC_KEY_PRESS_MS 30
+#define USB_HID_EXEC_KEY_RELEASE_SETTLE_MS 20
 #define USB_HID_EXEC_PANIC_RELEASE_MS 250
 
 static const char *TAG = "usb_hid_exec";
@@ -628,8 +628,17 @@ static esp_err_t send_key(uint8_t held_mods, const usb_hid_key_t *key)
 {
     esp_err_t ret = usb_hid_device_press(held_mods | key->modifier, key->keycode);
     if (ret != ESP_OK) return ret;
+    
     vTaskDelay(pdMS_TO_TICKS(USB_HID_EXEC_KEY_PRESS_MS));
-    ret = usb_hid_device_release();
+    
+    /* Mandatory release: try harder to release the key to avoid stuck keys */
+    int retries = 3;
+    while (retries-- > 0) {
+        ret = usb_hid_device_release();
+        if (ret == ESP_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    
     vTaskDelay(pdMS_TO_TICKS(USB_HID_EXEC_KEY_RELEASE_SETTLE_MS));
     return ret;
 }
@@ -642,7 +651,7 @@ static esp_err_t send_text(uint8_t held_mods, const char *text, const char *layo
         if (!key_from_ascii(text[i], layout, &key)) return ESP_ERR_NOT_SUPPORTED;
         esp_err_t ret = send_key(held_mods, &key);
         if (ret != ESP_OK) return ret;
-        vTaskDelay(pdMS_TO_TICKS(4));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     return ESP_OK;
 }
@@ -698,6 +707,7 @@ static esp_err_t execute_real_command(const char *command, const char *args,
         esp_err_t ret = send_text(*held_mods, args, layout);
         if (ret == ESP_OK && strcmp(command, "STRINGLN") == 0) {
             usb_hid_key_t enter = {.keycode = HID_KEY_ENTER};
+            vTaskDelay(pdMS_TO_TICKS(10));
             ret = send_key(*held_mods, &enter);
         }
         strlcpy(message, ret == ESP_OK ? "Text sent" : "Text send failed", message_size);
@@ -952,8 +962,8 @@ esp_err_t usb_hid_executor_init(void)
     s_queue = xQueueCreate(USB_HID_EXEC_QUEUE_LEN, sizeof(usb_hid_exec_request_t *));
     ESP_RETURN_ON_FALSE(s_queue != NULL, ESP_ERR_NO_MEM, TAG, "queue allocation failed");
 
-    BaseType_t ok = xTaskCreate(executor_task, "usb_hid_exec", USB_HID_EXEC_TASK_STACK,
-                                NULL, 5, NULL);
+    BaseType_t ok = xTaskCreatePinnedToCore(executor_task, "usb_hid_exec", USB_HID_EXEC_TASK_STACK,
+                                            NULL, 20, NULL, 1);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "task allocation failed");
 
     set_status(USB_HID_EXEC_IDLE, NULL, 0, 0, s_dry_run ? "Idle (dry run)" : "Idle");
