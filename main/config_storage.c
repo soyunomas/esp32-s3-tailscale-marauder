@@ -104,6 +104,10 @@ void config_storage_set_defaults(repeater_config_t *config)
         config->sched_rules[i].sta_enabled = true;
         config->sched_rules[i].tailscale_enabled = true;
     }
+    config->usb_hid_keepalive_enabled = false;
+    config->usb_hid_keepalive_interval_s = CFG_USB_HID_KEEPALIVE_INTERVAL_DEFAULT_S;
+    strlcpy(config->usb_hid_keepalive_key, CFG_USB_HID_KEEPALIVE_KEY_DEFAULT,
+            sizeof(config->usb_hid_keepalive_key));
 }
 
 esp_err_t config_storage_load(repeater_config_t *config)
@@ -229,6 +233,14 @@ esp_err_t config_storage_load(repeater_config_t *config)
     if (nvs_get_u8(handle, "sched_mode", &val) == ESP_OK) {
         config->sched_mode = (scheduler_mode_t)val;
     }
+    if (nvs_get_u8(handle, "hid_ka_en", &val) == ESP_OK) {
+        config->usb_hid_keepalive_enabled = val != 0;
+    }
+    if (nvs_get_u16(handle, "hid_ka_int", &val16) == ESP_OK) {
+        config->usb_hid_keepalive_interval_s = val16;
+    }
+    len = sizeof(config->usb_hid_keepalive_key);
+    nvs_get_str(handle, "hid_ka_key", config->usb_hid_keepalive_key, &len);
     for (int i = 0; i < CFG_SCHED_RULES_MAX; i++) {
         char key[16];
         scheduler_rule_t *rule = &config->sched_rules[i];
@@ -247,6 +259,8 @@ esp_err_t config_storage_load(repeater_config_t *config)
         if (nvs_get_u8(handle, key, &val) == ESP_OK) rule->sta_enabled = val != 0;
         snprintf(key, sizeof(key), "sr%d_ts", i);
         if (nvs_get_u8(handle, key, &val) == ESP_OK) rule->tailscale_enabled = val != 0;
+        snprintf(key, sizeof(key), "sr%d_hid", i);
+        nvs_get_u32(handle, key, &rule->usb_hid_macro_id);
         snprintf(key, sizeof(key), "sr%d_note", i);
         len = sizeof(rule->note);
         nvs_get_str(handle, key, rule->note, &len);
@@ -286,6 +300,17 @@ esp_err_t config_storage_load(repeater_config_t *config)
         config->sched_mode != SCHED_MODE_MANUAL_OFF) {
         ESP_LOGW(TAG, "Invalid scheduler mode in NVS, using always-on");
         config->sched_mode = SCHED_MODE_ALWAYS_ON;
+    }
+    if (config->usb_hid_keepalive_interval_s < CFG_USB_HID_KEEPALIVE_INTERVAL_MIN_S ||
+        config->usb_hid_keepalive_interval_s > CFG_USB_HID_KEEPALIVE_INTERVAL_MAX_S) {
+        ESP_LOGW(TAG, "Invalid USB HID keep-awake interval in NVS, using default");
+        config->usb_hid_keepalive_interval_s = CFG_USB_HID_KEEPALIVE_INTERVAL_DEFAULT_S;
+    }
+    if (config->usb_hid_keepalive_key[0] == '\0' ||
+        strlen(config->usb_hid_keepalive_key) >= CFG_USB_HID_KEEPALIVE_KEY_LEN) {
+        ESP_LOGW(TAG, "Invalid USB HID keep-awake key in NVS, using default");
+        strlcpy(config->usb_hid_keepalive_key, CFG_USB_HID_KEEPALIVE_KEY_DEFAULT,
+                sizeof(config->usb_hid_keepalive_key));
     }
     for (int i = 0; i < CFG_SCHED_RULES_MAX; i++) {
         if (!scheduler_rule_valid(&config->sched_rules[i])) {
@@ -354,6 +379,9 @@ esp_err_t config_storage_save(const repeater_config_t *config)
     nvs_set_u8(handle, "log_ml", config->log_level_microlink);
     nvs_set_str(handle, "sched_tz", config->sched_tz);
     nvs_set_u8(handle, "sched_mode", (uint8_t)config->sched_mode);
+    nvs_set_u8(handle, "hid_ka_en", config->usb_hid_keepalive_enabled ? 1 : 0);
+    nvs_set_u16(handle, "hid_ka_int", config->usb_hid_keepalive_interval_s);
+    nvs_set_str(handle, "hid_ka_key", config->usb_hid_keepalive_key);
     for (int i = 0; i < CFG_SCHED_RULES_MAX; i++) {
         char key[16];
         const scheduler_rule_t *rule = &config->sched_rules[i];
@@ -372,6 +400,8 @@ esp_err_t config_storage_save(const repeater_config_t *config)
         nvs_set_u8(handle, key, rule->sta_enabled ? 1 : 0);
         snprintf(key, sizeof(key), "sr%d_ts", i);
         nvs_set_u8(handle, key, rule->tailscale_enabled ? 1 : 0);
+        snprintf(key, sizeof(key), "sr%d_hid", i);
+        nvs_set_u32(handle, key, rule->usb_hid_macro_id);
         snprintf(key, sizeof(key), "sr%d_note", i);
         nvs_set_str(handle, key, rule->note);
     }
@@ -409,6 +439,10 @@ void config_storage_apply_log_levels(const repeater_config_t *config)
 
     /* Apply global first; then override the heavy MicroLink/WireGuard tags. */
     esp_log_level_set("*", global);
+    /* esp_tinyusb prints a multi-line Unicode descriptor table at INFO level
+     * during HID init; it corrupts the compact web log view and adds no
+     * operational value after our HID init message. Keep real errors visible. */
+    esp_log_level_set("tusb_desc", ESP_LOG_ERROR);
 
     static const char *ml_tags[] = {
         "ml_coord", "ml_h2", "ml_noise", "ml_wg_mgr", "ml_derp",

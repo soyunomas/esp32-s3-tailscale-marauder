@@ -128,6 +128,10 @@ nav{display:flex;gap:4px;background:var(--surface);border-radius:var(--radius);p
 .usb-hid-textarea.error-line{border-color:var(--red);background-color:var(--surface);background-image:linear-gradient(rgba(248,113,113,.3),rgba(248,113,113,.3));background-repeat:no-repeat;background-size:100% var(--usb-hid-line-height,20px);background-position:0 var(--usb-hid-error-y,0)}
 .usb-hid-actions{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:10px}
 .usb-hid-actions .btn{justify-content:center}
+.usb-hid-toggle{font-size:.78rem;color:var(--text2)}
+.usb-hid-keepalive-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.usb-hid-keepalive-actions{grid-template-columns:1fr}
+.usb-hid-keepalive-status{margin-top:10px;min-height:42px}
 .usb-hid-count{font-size:.72rem;color:var(--text2);font-weight:800;border:1px solid var(--border);border-radius:999px;padding:3px 7px;background:var(--surface)}
 .usb-hid-saved-card{padding:0;background:transparent;border:none}
 .usb-hid-saved-card .usb-hid-card-head{padding:0 2px;margin-bottom:8px}
@@ -238,8 +242,10 @@ input[readonly]{opacity:.75}
 .sched-quick-days button{border:1px solid var(--border);border-radius:999px;background:var(--surface2);color:var(--text2);font-size:.68rem;font-weight:800;padding:5px 10px;cursor:pointer;transition:all .2s}
 .sched-quick-days button:hover{border-color:var(--accent);color:var(--text)}
 
-.sched-rule input[type="time"],.sched-rule input[type="text"]{width:100%;padding:9px 10px;background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.85rem;outline:none}
+.sched-rule input[type="time"],.sched-rule input[type="text"],.sched-rule select{width:100%;padding:9px 10px;background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.85rem;outline:none}
 .sched-rule input:focus{border-color:var(--accent)}
+.sched-rule select:focus{border-color:var(--accent)}
+.sched-macro-grid{grid-template-columns:1fr;margin-top:8px}
 .rule-note{margin-top:8px;font-style:italic}
 
 
@@ -251,6 +257,7 @@ input[readonly]{opacity:.75}
   .usb-hid-grid{grid-template-columns:1fr}
   .usb-hid-header{flex-direction:column;align-items:stretch}
   .usb-hid-actions{grid-template-columns:1fr}
+  .usb-hid-keepalive-grid{grid-template-columns:1fr}
   .usb-hid-macro{grid-template-columns:1fr;align-items:stretch}
   .usb-hid-macro-actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(64px,1fr));width:100%}
   .usb-hid-icon-btn{width:100%}

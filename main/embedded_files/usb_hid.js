@@ -12,11 +12,17 @@
   var exampleListEl=document.getElementById('usbHidExampleList');
   var countEl=document.getElementById('usbHidMacroCount');
   var statusEl=document.getElementById('usbHidStatus');
+  var keepaliveEnabled=document.getElementById('usbHidKeepaliveEnabled');
+  var keepaliveKey=document.getElementById('usbHidKeepaliveKey');
+  var keepaliveInterval=document.getElementById('usbHidKeepaliveInterval');
+  var keepaliveSave=document.getElementById('usbHidKeepaliveSave');
+  var keepaliveStatus=document.getElementById('usbHidKeepaliveStatus');
   var stateEl=document.querySelector('.usb-hid-state');
   var currentId=0;
   var statusTimer=0;
   var errorLine=0;
   var defaultLayout='es';
+  var keepaliveLast=null;
   var examples=[
     {
       name:'Windows shutdown',
@@ -65,6 +71,10 @@
 
   function setState(text){
     if(stateEl) stateEl.textContent=text;
+  }
+
+  function setKeepaliveStatus(text){
+    if(keepaliveStatus) keepaliveStatus.textContent=text;
   }
 
   function clearErrorLine(){
@@ -158,6 +168,9 @@
       setStatus(formatExecutorStatus(status));
       setState(status.dry_run?'Dry run':'USB HID');
       updateExecutionButtons(running);
+      if(keepaliveLast&&keepaliveLast.enabled){
+        loadKeepalive(true);
+      }
       if(!running) stopStatusPolling();
       return status;
     }).catch(function(){
@@ -176,6 +189,68 @@
 
   function normalizeName(name){
     return (name||'').trim().slice(0,32);
+  }
+
+  function formatKeepaliveStatus(data){
+    if(!data||!data.enabled) return 'Disabled';
+    var mode=data.dry_run?'Dry run':'USB HID';
+    var text=mode+': '+data.key+' every '+data.interval_s+'s';
+    if(data.paused) text+=' - paused while macro is running';
+    else if(!data.ready&&!data.dry_run) text+=' - host not ready';
+    else if(data.message) text+=' - '+data.message;
+    return text;
+  }
+
+  function loadKeepalive(statusOnly){
+    if(!keepaliveStatus) return Promise.resolve();
+    return fetch('/api/usb-hid/keepalive',{headers:authHeaders()})
+    .then(function(r){
+      if(!r.ok) throw new Error('keep-awake load failed');
+      return r.json();
+    }).then(function(data){
+      keepaliveLast=data;
+      if(!statusOnly){
+        if(keepaliveEnabled) keepaliveEnabled.checked=!!data.enabled;
+        if(keepaliveKey) keepaliveKey.value=data.key||'SCROLLLOCK';
+        if(keepaliveInterval) keepaliveInterval.value=String(data.interval_s||60);
+      }
+      setKeepaliveStatus(formatKeepaliveStatus(data));
+      return data;
+    }).catch(function(){
+      setKeepaliveStatus('Keep Awake unavailable');
+    });
+  }
+
+  function saveKeepalive(){
+    if(!keepaliveSave) return;
+    var interval=Number(keepaliveInterval&&keepaliveInterval.value)||60;
+    if(interval<5||interval>3600){
+      setKeepaliveStatus('Interval must be between 5 and 3600 seconds');
+      if(keepaliveInterval) keepaliveInterval.focus();
+      return;
+    }
+    keepaliveSave.disabled=true;
+    fetch('/api/usb-hid/keepalive',{
+      method:'POST',
+      headers:authHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({
+        enabled:!!(keepaliveEnabled&&keepaliveEnabled.checked),
+        key:(keepaliveKey&&keepaliveKey.value)||'SCROLLLOCK',
+        interval_s:interval
+      })
+    }).then(function(r){
+      if(!r.ok) throw new Error('keep-awake save failed');
+      return r.json();
+    }).then(function(data){
+      keepaliveLast=data;
+      if(keepaliveKey) keepaliveKey.value=data.key||'SCROLLLOCK';
+      if(keepaliveInterval) keepaliveInterval.value=String(data.interval_s||interval);
+      setKeepaliveStatus(formatKeepaliveStatus(data));
+    }).catch(function(){
+      setKeepaliveStatus('Keep Awake save failed');
+    }).finally(function(){
+      keepaliveSave.disabled=false;
+    });
   }
 
   function currentMacro(){
@@ -445,6 +520,7 @@
   if(panicBtn) panicBtn.addEventListener('click',panicStop);
   if(saveBtn) saveBtn.addEventListener('click',saveMacro);
   if(clearBtn) clearBtn.addEventListener('click',function(){clearEditor(true)});
+  if(keepaliveSave) keepaliveSave.addEventListener('click',saveKeepalive);
   if(scriptInput){
     scriptInput.addEventListener('input',clearErrorLine);
     scriptInput.addEventListener('scroll',updateErrorLine);
@@ -454,4 +530,5 @@
   renderMacros();
   renderExamples();
   loadStatus();
+  loadKeepalive(false);
 })();

@@ -33,7 +33,7 @@ Después de cambios importantes:
 
 ## 9. Mantén memoria persistente
 Actualiza:
-- TODO.md
+- todo.md
 - LESSONS.md
 
 ## 10. Contexto largo = degradación

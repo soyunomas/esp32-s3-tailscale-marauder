@@ -5,6 +5,7 @@
   var NET_MODE_TS_GATEWAY=1;
   var schedRules=[];
   var schedMode=0;
+  var schedMacroOptions=[];
 
   function getAuthHeaders(){return {'Authorization':authHeader}}
   function authFetch(url,opts){
@@ -720,11 +721,38 @@
       '<span class="sched-pill '+(r.sta_enabled!==false?'on':'off')+'">STA '+(r.sta_enabled!==false?'ON':'OFF')+'</span>',
       '<span class="sched-pill '+(r.tailscale_enabled!==false?'on':'off')+'">TS '+(r.tailscale_enabled!==false?'ON':'OFF')+'</span>'
     ];
+    var macroId=Number(r.usb_hid_macro_id)||0;
+    if(macroId){
+      states.push('<span class="sched-pill on">HID '+escHtml(schedulerMacroName(macroId))+'</span>');
+    }
     return '<div class="sched-rule-tags">' +
       '<span class="sched-tag-days">' + schedDaysLabel(r.days) + '</span>' +
       '<span class="sched-tag-time">' + minToTime(r.start_min) + ' - ' + minToTime(r.end_min||0) + '</span>' +
       '<div class="sched-tag-states">' + states.join('') + '</div>' +
       '</div>';
+  }
+
+  function schedulerMacroName(id){
+    id=Number(id)||0;
+    for(var i=0;i<schedMacroOptions.length;i++){
+      if(Number(schedMacroOptions[i].id)===id) return schedMacroOptions[i].name||('Macro #'+id);
+    }
+    return 'Macro #'+id;
+  }
+
+  function schedulerMacroSelectHtml(selectedId){
+    selectedId=Number(selectedId)||0;
+    var found=selectedId===0;
+    var html='<option value="0">No macro</option>';
+    schedMacroOptions.forEach(function(macro){
+      var id=Number(macro.id)||0;
+      if(id===selectedId) found=true;
+      html+='<option value="'+id+'" '+(id===selectedId?'selected':'')+'>'+escHtml(macro.name||('Macro #'+id))+'</option>';
+    });
+    if(!found){
+      html+='<option value="'+selectedId+'" selected>Missing macro #'+selectedId+'</option>';
+    }
+    return html;
   }
 
   function renderSchedulerMode(){
@@ -733,12 +761,17 @@
     });
     var warn=document.getElementById('schedWarning');
     if(!warn) return;
+    var hasEnabledRules=schedRules.some(function(r){return !!r.enabled});
     if(schedMode===2){
       warn.textContent='Manual off: AP radio is permanently disabled. STA and Tailscale remain connected if configured.';
       warn.style.display='block';
       warn.className='notice danger';
     }else if(schedMode===1){
       warn.textContent='Scheduled: AP/STA/TS states will follow the rules below. AP is kept ON if STA is offline.';
+      warn.style.display='block';
+      warn.className='notice warning';
+    }else if(hasEnabledRules){
+      warn.textContent='Always on: saved rules and USB HID macros are inactive until Scheduled is selected.';
       warn.style.display='block';
       warn.className='notice warning';
     }else{
@@ -783,7 +816,10 @@
           '<label class="toggle-label toggle-sm"><input type="checkbox" class="rule-sta" '+(r.sta_enabled!==false?'checked':'')+'> STA Enabled</label>'+
           '<label class="toggle-label toggle-sm"><input type="checkbox" class="rule-ts" '+(r.tailscale_enabled!==false?'checked':'')+'> TS Enabled</label>'+
         '</div>'+
-        '<input type="text" class="rule-note" maxlength="31" placeholder="Note (e.g. Work hours)" value="'+escHtml(r.note||'')+'">';
+        '<div class="sched-rule-grid sched-macro-grid">'+
+          '<div class="form-group"><label>USB HID Macro</label><select class="rule-hid-macro">'+schedulerMacroSelectHtml(r.usb_hid_macro_id)+'</select></div>'+
+          '<div class="form-group"><label>Note</label><input type="text" class="rule-note" maxlength="31" placeholder="Optional note" value="'+escHtml(r.note||'')+'"></div>'+
+        '</div>';
       row.querySelector('.pf-del').onclick=function(){schedRules.splice(i,1);renderSchedulerRules()};
       row.querySelectorAll('.day-btn').forEach(function(btn){
         btn.onclick=function(){
@@ -804,12 +840,14 @@
       row.querySelector('.rule-ap').onchange=function(){collectSchedulerRules();renderSchedulerRules()};
       row.querySelector('.rule-sta').onchange=function(){collectSchedulerRules();renderSchedulerRules()};
       row.querySelector('.rule-ts').onchange=function(){collectSchedulerRules();renderSchedulerRules()};
+      row.querySelector('.rule-hid-macro').onchange=function(){collectSchedulerRules();renderSchedulerRules()};
       row.querySelector('.rule-note').oninput=function(){r.note=this.value.trim()};
       box.appendChild(row);
     });
     if(schedRules.length===0){
       box.innerHTML='<div class="empty-state">No schedule rules</div>';
     }
+    renderSchedulerMode();
   }
 
   function collectSchedulerRules(){
@@ -822,21 +860,14 @@
       schedRules[i].ap_enabled=row.querySelector('.rule-ap').checked;
       schedRules[i].sta_enabled=row.querySelector('.rule-sta').checked;
       schedRules[i].tailscale_enabled=row.querySelector('.rule-ts').checked;
+      schedRules[i].usb_hid_macro_id=parseInt(row.querySelector('.rule-hid-macro').value,10)||0;
       schedRules[i].note=row.querySelector('.rule-note').value.trim();
     });
   }
 
   window.addSchedulerRule=function(){
     if(schedRules.length>=8){toast('Maximum 8 rules','error');return}
-    schedRules.push({enabled:true,days:1,start_min:14*60,end_min:16*60,ap_enabled:false,sta_enabled:true,tailscale_enabled:true,note:'Work access'});
-    renderSchedulerRules();
-  };
-
-  window.addWorkAccessRule=function(){
-    if(schedRules.length>=8){toast('Maximum 8 rules','error');return}
-    schedRules.push({enabled:true,days:1,start_min:14*60,end_min:16*60,ap_enabled:false,sta_enabled:true,tailscale_enabled:true,note:'Work access'});
-    schedMode=1;
-    renderSchedulerMode();
+    schedRules.push({enabled:false,days:0,start_min:0,end_min:60,ap_enabled:true,sta_enabled:true,tailscale_enabled:true,usb_hid_macro_id:0,note:''});
     renderSchedulerRules();
   };
 
@@ -882,16 +913,23 @@
 
   function loadScheduler(){
     authFetch('/api/scheduler/config').then(function(r){return r.json()}).then(function(cfg){
-      schedMode=cfg.mode||0;
-      schedRules=(cfg.rules||[]).filter(function(r){return r.enabled||r.days||r.start_min||r.end_min||r.note});
-      schedRules.forEach(function(r){
-        if(r.sta_enabled===undefined) r.sta_enabled=true;
-        if(r.tailscale_enabled===undefined) r.tailscale_enabled=true;
+      authFetch('/api/usb-hid/macros').then(function(r){return r.json()}).then(function(data){
+        schedMacroOptions=Array.isArray(data.macros)?data.macros:[];
+      }).catch(function(){
+        schedMacroOptions=[];
+      }).then(function(){
+        schedMode=cfg.mode||0;
+        schedRules=(cfg.rules||[]).filter(function(r){return r.enabled||r.days||r.start_min||r.end_min||r.note||r.usb_hid_macro_id});
+        schedRules.forEach(function(r){
+          if(r.sta_enabled===undefined) r.sta_enabled=true;
+          if(r.tailscale_enabled===undefined) r.tailscale_enabled=true;
+          if(r.usb_hid_macro_id===undefined) r.usb_hid_macro_id=0;
+        });
+        document.getElementById('schedTimezone').value=cfg.timezone||'WET0WEST,M3.5.0/1,M10.5.0';
+        renderSchedulerMode();
+        renderSchedulerRules();
+        loadSchedulerStatus();
       });
-      document.getElementById('schedTimezone').value=cfg.timezone||'WET0WEST,M3.5.0/1,M10.5.0';
-      renderSchedulerMode();
-      renderSchedulerRules();
-      loadSchedulerStatus();
     }).catch(function(){});
   }
 
@@ -906,7 +944,7 @@
     }
     var data={timezone:document.getElementById('schedTimezone').value,mode:schedMode};
     for(var i=0;i<8;i++){
-      var r=schedRules[i]||{enabled:false,days:0,start_min:0,end_min:0,ap_enabled:true,sta_enabled:true,tailscale_enabled:true,note:''};
+      var r=schedRules[i]||{enabled:false,days:0,start_min:0,end_min:0,ap_enabled:true,sta_enabled:true,tailscale_enabled:true,usb_hid_macro_id:0,note:''};
       data['rule'+i+'_enabled']=!!r.enabled;
       data['rule'+i+'_days']=r.days||0;
       data['rule'+i+'_start_min']=r.start_min||0;
@@ -914,6 +952,7 @@
       data['rule'+i+'_ap_enabled']=!!r.ap_enabled;
       data['rule'+i+'_sta_enabled']=r.sta_enabled!==false;
       data['rule'+i+'_tailscale_enabled']=r.tailscale_enabled!==false;
+      data['rule'+i+'_usb_hid_macro_id']=Number(r.usb_hid_macro_id)||0;
       data['rule'+i+'_note']=r.note||'';
     }
     authFetch('/api/scheduler/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})

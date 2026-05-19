@@ -672,6 +672,16 @@ static bool scheduler_rule_valid_http(const scheduler_rule_t *rule)
     return true;
 }
 
+static bool scheduler_macro_id_valid_http(uint32_t macro_id)
+{
+    if (macro_id == 0) return true;
+    usb_hid_macro_t *macro = calloc(1, sizeof(*macro));
+    if (!macro) return false;
+    esp_err_t ret = usb_hid_macro_store_get(macro_id, macro);
+    free(macro);
+    return ret == ESP_OK;
+}
+
 static esp_err_t api_config_post_handler(httpd_req_t *req)
 {
     if (!require_auth(req)) return ESP_OK;
@@ -983,7 +993,7 @@ static esp_err_t api_scheduler_config_get_handler(httpd_req_t *req)
         len = snprintf(buf, sizeof(buf),
             "%s{\"enabled\":%s,\"days\":%u,\"start_min\":%u,"
             "\"end_min\":%u,\"ap_enabled\":%s,\"sta_enabled\":%s,"
-            "\"tailscale_enabled\":%s,\"note\":\"%s\"}",
+            "\"tailscale_enabled\":%s,\"usb_hid_macro_id\":%lu,\"note\":\"%s\"}",
             i ? "," : "",
             rule->enabled ? "true" : "false",
             rule->days,
@@ -992,6 +1002,7 @@ static esp_err_t api_scheduler_config_get_handler(httpd_req_t *req)
             rule->ap_enabled ? "true" : "false",
             rule->sta_enabled ? "true" : "false",
             rule->tailscale_enabled ? "true" : "false",
+            (unsigned long)rule->usb_hid_macro_id,
             esc_note);
         httpd_resp_send_chunk(req, buf, len);
     }
@@ -1004,7 +1015,7 @@ static esp_err_t api_scheduler_config_post_handler(httpd_req_t *req)
 {
     if (!require_auth(req)) return ESP_OK;
 
-    char buf[3072];
+    char buf[4096];
     int received = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (received <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
@@ -1116,6 +1127,23 @@ static esp_err_t api_scheduler_config_post_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
         if (present) rule->tailscale_enabled = bval;
+
+        snprintf(key, sizeof(key), "rule%d_usb_hid_macro_id", i);
+        if (!json_get_int_strict(buf, key, &ival, &present)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid rule USB HID macro");
+            return ESP_FAIL;
+        }
+        if (present) {
+            if (ival < 0) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "rule USB HID macro out of range");
+                return ESP_FAIL;
+            }
+            rule->usb_hid_macro_id = (uint32_t)ival;
+            if (!scheduler_macro_id_valid_http(rule->usb_hid_macro_id)) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "scheduled USB HID macro not found");
+                return ESP_FAIL;
+            }
+        }
 
         char note[CFG_SCHED_NOTE_LEN];
         snprintf(key, sizeof(key), "rule%d_note", i);
@@ -1904,6 +1932,124 @@ static esp_err_t api_usb_hid_status_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t usb_hid_send_keepalive_json(httpd_req_t *req)
+{
+    usb_hid_keepalive_status_t status;
+    usb_hid_executor_get_keepalive_status(&status);
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json allocation failed");
+        return ESP_FAIL;
+    }
+    cJSON_AddBoolToObject(root, "enabled", status.enabled);
+    cJSON_AddBoolToObject(root, "paused", status.paused);
+    cJSON_AddBoolToObject(root, "dry_run", status.dry_run);
+    cJSON_AddBoolToObject(root, "ready", status.ready);
+    cJSON_AddNumberToObject(root, "interval_s", status.interval_s);
+    cJSON_AddNumberToObject(root, "sent_count", status.sent_count);
+    cJSON_AddStringToObject(root, "key", status.key);
+    cJSON_AddStringToObject(root, "message", status.message);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json allocation failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, json);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t api_usb_hid_keepalive_get_handler(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    return usb_hid_send_keepalive_json(req);
+}
+
+static esp_err_t api_usb_hid_keepalive_post_handler(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+
+    char *body = read_request_body(req, 512);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid keep-awake payload");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+        return ESP_FAIL;
+    }
+
+    bool enabled = s_config->usb_hid_keepalive_enabled;
+    uint16_t interval_s = s_config->usb_hid_keepalive_interval_s;
+    char key[CFG_USB_HID_KEEPALIVE_KEY_LEN];
+    strlcpy(key, s_config->usb_hid_keepalive_key, sizeof(key));
+
+    cJSON *enabled_item = cJSON_GetObjectItem(root, "enabled");
+    if (enabled_item) {
+        if (!cJSON_IsBool(enabled_item)) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "enabled must be boolean");
+            return ESP_FAIL;
+        }
+        enabled = cJSON_IsTrue(enabled_item);
+    }
+
+    cJSON *interval_item = cJSON_GetObjectItem(root, "interval_s");
+    if (interval_item) {
+        if (!cJSON_IsNumber(interval_item)) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "interval_s must be a number");
+            return ESP_FAIL;
+        }
+        int value = interval_item->valueint;
+        if (value < CFG_USB_HID_KEEPALIVE_INTERVAL_MIN_S ||
+            value > CFG_USB_HID_KEEPALIVE_INTERVAL_MAX_S) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "interval_s out of range");
+            return ESP_FAIL;
+        }
+        interval_s = (uint16_t)value;
+    }
+
+    cJSON *key_item = cJSON_GetObjectItem(root, "key");
+    if (key_item) {
+        if (!cJSON_IsString(key_item) ||
+            strlen(key_item->valuestring) >= CFG_USB_HID_KEEPALIVE_KEY_LEN ||
+            !usb_hid_keepalive_key_valid(key_item->valuestring)) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid keep-awake key");
+            return ESP_FAIL;
+        }
+        strlcpy(key, key_item->valuestring, sizeof(key));
+    }
+    cJSON_Delete(root);
+
+    s_config->usb_hid_keepalive_enabled = enabled;
+    s_config->usb_hid_keepalive_interval_s = interval_s;
+    strlcpy(s_config->usb_hid_keepalive_key, key, sizeof(s_config->usb_hid_keepalive_key));
+
+    esp_err_t ret = config_storage_save(s_config);
+    if (ret != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "keep-awake save failed");
+        return ESP_FAIL;
+    }
+
+    ret = usb_hid_executor_configure_keepalive(enabled, key, interval_s);
+    if (ret != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "keep-awake apply failed");
+        return ESP_FAIL;
+    }
+
+    return usb_hid_send_keepalive_json(req);
+}
+
 static esp_err_t api_ping_handler(httpd_req_t *req)
 {
     if (!require_auth(req)) return ESP_OK;
@@ -2132,7 +2278,7 @@ esp_err_t web_server_start(repeater_config_t *config)
     s_config = config;
 
     httpd_config_t http_config = HTTPD_DEFAULT_CONFIG();
-    http_config.max_uri_handlers = 40;
+    http_config.max_uri_handlers = 42;
     http_config.uri_match_fn = httpd_uri_match_wildcard;
     http_config.lru_purge_enable = true;
     http_config.stack_size = 8192;
@@ -2169,6 +2315,8 @@ esp_err_t web_server_start(repeater_config_t *config)
     httpd_uri_t uri_usb_hid_stop = { .uri = "/api/usb-hid/stop", .method = HTTP_POST, .handler = api_usb_hid_stop_handler };
     httpd_uri_t uri_usb_hid_panic = { .uri = "/api/usb-hid/panic", .method = HTTP_POST, .handler = api_usb_hid_panic_handler };
     httpd_uri_t uri_usb_hid_status = { .uri = "/api/usb-hid/status", .method = HTTP_GET, .handler = api_usb_hid_status_handler };
+    httpd_uri_t uri_usb_hid_keepalive_get = { .uri = "/api/usb-hid/keepalive", .method = HTTP_GET, .handler = api_usb_hid_keepalive_get_handler };
+    httpd_uri_t uri_usb_hid_keepalive_post = { .uri = "/api/usb-hid/keepalive", .method = HTTP_POST, .handler = api_usb_hid_keepalive_post_handler };
     httpd_uri_t uri_ping     = { .uri = "/api/ping",        .method = HTTP_POST, .handler = api_ping_handler };
     httpd_uri_t uri_restart  = { .uri = "/api/restart",     .method = HTTP_POST, .handler = api_restart_handler };
     httpd_uri_t uri_auth_chg = { .uri = "/api/auth/change", .method = HTTP_POST, .handler = api_auth_change_handler };
@@ -2208,6 +2356,8 @@ esp_err_t web_server_start(repeater_config_t *config)
     httpd_register_uri_handler(s_server, &uri_usb_hid_stop);
     httpd_register_uri_handler(s_server, &uri_usb_hid_panic);
     httpd_register_uri_handler(s_server, &uri_usb_hid_status);
+    httpd_register_uri_handler(s_server, &uri_usb_hid_keepalive_get);
+    httpd_register_uri_handler(s_server, &uri_usb_hid_keepalive_post);
     httpd_register_uri_handler(s_server, &uri_ping);
     httpd_register_uri_handler(s_server, &uri_restart);
     httpd_register_uri_handler(s_server, &uri_auth_chg);

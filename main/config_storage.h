@@ -26,6 +26,11 @@
 #define CFG_SCHED_RULES_MAX 8
 #define CFG_SCHED_NOTE_LEN 32
 #define CFG_SCHED_TZ_DEFAULT "WET0WEST,M3.5.0/1,M10.5.0"
+#define CFG_USB_HID_KEEPALIVE_KEY_LEN 16
+#define CFG_USB_HID_KEEPALIVE_INTERVAL_MIN_S 5
+#define CFG_USB_HID_KEEPALIVE_INTERVAL_MAX_S 3600
+#define CFG_USB_HID_KEEPALIVE_INTERVAL_DEFAULT_S 60
+#define CFG_USB_HID_KEEPALIVE_KEY_DEFAULT "SCROLLLOCK"
 
 typedef enum {
     NET_MODE_REPEATER = 0,
@@ -46,6 +51,7 @@ typedef struct {
     bool ap_enabled;
     bool sta_enabled;
     bool tailscale_enabled;
+    uint32_t usb_hid_macro_id; /* 0 = no scheduled macro */
     char note[CFG_SCHED_NOTE_LEN];
 } scheduler_rule_t;
 
@@ -113,6 +119,9 @@ typedef struct {
     char sched_tz[CFG_SCHED_TZ_LEN];
     scheduler_mode_t sched_mode;
     scheduler_rule_t sched_rules[CFG_SCHED_RULES_MAX];
+    bool usb_hid_keepalive_enabled;
+    uint16_t usb_hid_keepalive_interval_s;
+    char usb_hid_keepalive_key[CFG_USB_HID_KEEPALIVE_KEY_LEN];
 } repeater_config_t;
 
 esp_err_t config_storage_init(void);

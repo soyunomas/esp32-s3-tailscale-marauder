@@ -37,6 +37,7 @@ static uint32_t apply_jitter(uint32_t base_ms, uint8_t jitter_percent)
 #define USB_HID_EXEC_KEY_PRESS_MS 30
 #define USB_HID_EXEC_KEY_RELEASE_SETTLE_MS 20
 #define USB_HID_EXEC_PANIC_RELEASE_MS 250
+#define USB_HID_KEEPALIVE_TASK_STACK 3072
 
 static const char *TAG = "usb_hid_exec";
 
@@ -53,14 +54,22 @@ typedef struct {
 
 static QueueHandle_t s_queue;
 static SemaphoreHandle_t s_lock;
+static SemaphoreHandle_t s_keepalive_lock;
+static SemaphoreHandle_t s_hid_io_lock;
 static volatile bool s_stop_requested;
 static volatile bool s_executing;
+static volatile bool s_macro_reserved;
 static bool s_dry_run = true;
 static usb_hid_exec_status_t s_status = {
     .state = USB_HID_EXEC_IDLE,
     .dry_run = true,
     .message = "Idle",
 };
+static bool s_keepalive_enabled;
+static uint16_t s_keepalive_interval_s = 60;
+static char s_keepalive_key[USB_HID_KEEPALIVE_KEY_LEN] = "SCROLLLOCK";
+static uint32_t s_keepalive_sent_count;
+static char s_keepalive_message[96] = "Disabled";
 
 bool usb_hid_executor_resolve_internal_var(const char *name, int *value_out)
 {
@@ -174,6 +183,22 @@ static uint32_t compute_command_delay_ms(char *line, usb_hid_eval_ctx_t *eval)
     if (strncasecmp(trimmed, "DELAY", 5) != 0) return 1;
     char *arg = trim_left(trimmed + 5);
     if (*arg == '\0') return 1;
+    int value = 0;
+    if (!usb_hid_eval_expression(eval, arg, &value)) {
+        long lv = strtol(arg, NULL, 10);
+        value = (int)lv;
+    }
+    if (value < 0) value = 1;
+    if (value > USB_HID_EXEC_MAX_DELAY_MS) value = USB_HID_EXEC_MAX_DELAY_MS;
+    return (uint32_t)value;
+}
+
+static uint32_t compute_delay_arg_ms(const char *arg, usb_hid_eval_ctx_t *eval)
+{
+    if (!arg) return 1;
+    while (*arg && isspace((unsigned char)*arg)) arg++;
+    if (*arg == '\0') return 1;
+
     int value = 0;
     if (!usb_hid_eval_expression(eval, arg, &value)) {
         long lv = strtol(arg, NULL, 10);
@@ -451,7 +476,9 @@ static bool dry_run_command_finishes_macro(const char *command, char *message, s
 #define HID_KEY_COMMA         0x36
 #define HID_KEY_PERIOD        0x37
 #define HID_KEY_SLASH         0x38
+#define HID_KEY_CAPS_LOCK     0x39
 #define HID_KEY_F1            0x3a
+#define HID_KEY_SCROLL_LOCK   0x47
 #define HID_KEY_PRINT_SCREEN  0x46
 #define HID_KEY_PAUSE         0x48
 #define HID_KEY_INSERT        0x49
@@ -464,6 +491,7 @@ static bool dry_run_command_finishes_macro(const char *command, char *message, s
 #define HID_KEY_ARROW_LEFT    0x50
 #define HID_KEY_ARROW_DOWN    0x51
 #define HID_KEY_ARROW_UP      0x52
+#define HID_KEY_NUM_LOCK      0x53
 #define HID_KEY_NON_US_BACKSLASH 0x64
 #define HID_KEY_MENU          0x65
 
@@ -763,6 +791,119 @@ static bool key_from_token(const char *token, const char *layout, usb_hid_key_t 
     }
 
     return key->keycode != HID_KEY_NONE;
+}
+
+static bool keepalive_canonical_key(const char *input, char *out, size_t out_size)
+{
+    if (!input || !out || out_size == 0) return false;
+
+    char normalized[USB_HID_KEEPALIVE_KEY_LEN] = {0};
+    size_t pos = 0;
+    for (size_t i = 0; input[i] != '\0' && pos + 1 < sizeof(normalized); i++) {
+        unsigned char c = (unsigned char)input[i];
+        if (c == '-' || c == '_' || c == '/' || isspace(c)) continue;
+        if (!isalnum(c)) return false;
+        normalized[pos++] = (char)toupper(c);
+    }
+    if (pos == 0) return false;
+
+    if (strcmp(normalized, "SCROLLLOCK") == 0) {
+        strlcpy(out, "SCROLLLOCK", out_size);
+        return true;
+    }
+    if (strcmp(normalized, "PAUSE") == 0 ||
+        strcmp(normalized, "BREAK") == 0 ||
+        strcmp(normalized, "PAUSEBREAK") == 0) {
+        strlcpy(out, "PAUSE", out_size);
+        return true;
+    }
+    if (strcmp(normalized, "CAPSLOCK") == 0) {
+        strlcpy(out, "CAPSLOCK", out_size);
+        return true;
+    }
+    if (strcmp(normalized, "NUMLOCK") == 0) {
+        strlcpy(out, "NUMLOCK", out_size);
+        return true;
+    }
+    if (strcmp(normalized, "PRINTSCREEN") == 0) {
+        strlcpy(out, "PRINTSCREEN", out_size);
+        return true;
+    }
+    if (strcmp(normalized, "MENU") == 0) {
+        strlcpy(out, "MENU", out_size);
+        return true;
+    }
+    if (normalized[0] == 'F' && normalized[1] != '\0') {
+        char *end = NULL;
+        long f = strtol(normalized + 1, &end, 10);
+        if (*end == '\0' && f >= 1 && f <= 12) {
+            strlcpy(out, normalized, out_size);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool keepalive_key_from_name(const char *input, usb_hid_key_t *key)
+{
+    if (!key) return false;
+    memset(key, 0, sizeof(*key));
+
+    char canonical[USB_HID_KEEPALIVE_KEY_LEN];
+    if (!keepalive_canonical_key(input, canonical, sizeof(canonical))) return false;
+
+    if (strcmp(canonical, "SCROLLLOCK") == 0) key->keycode = HID_KEY_SCROLL_LOCK;
+    else if (strcmp(canonical, "PAUSE") == 0) key->keycode = HID_KEY_PAUSE;
+    else if (strcmp(canonical, "CAPSLOCK") == 0) key->keycode = HID_KEY_CAPS_LOCK;
+    else if (strcmp(canonical, "NUMLOCK") == 0) key->keycode = HID_KEY_NUM_LOCK;
+    else return key_from_token(canonical, USB_HID_MACRO_DEFAULT_LAYOUT, key) && key->modifier == 0;
+
+    return key->keycode != HID_KEY_NONE;
+}
+
+bool usb_hid_keepalive_key_valid(const char *key)
+{
+    usb_hid_key_t parsed;
+    return keepalive_key_from_name(key, &parsed);
+}
+
+esp_err_t usb_hid_executor_configure_keepalive(bool enabled, const char *key, uint16_t interval_s)
+{
+    if (interval_s < 5 || interval_s > 3600) return ESP_ERR_INVALID_ARG;
+
+    char canonical[USB_HID_KEEPALIVE_KEY_LEN];
+    if (!keepalive_canonical_key(key, canonical, sizeof(canonical))) return ESP_ERR_INVALID_ARG;
+
+    if (s_keepalive_lock) xSemaphoreTake(s_keepalive_lock, portMAX_DELAY);
+    s_keepalive_enabled = enabled;
+    s_keepalive_interval_s = interval_s;
+    strlcpy(s_keepalive_key, canonical, sizeof(s_keepalive_key));
+    strlcpy(s_keepalive_message, enabled ? "Waiting for interval" : "Disabled",
+            sizeof(s_keepalive_message));
+    if (s_keepalive_lock) xSemaphoreGive(s_keepalive_lock);
+    return ESP_OK;
+}
+
+void usb_hid_executor_get_keepalive_status(usb_hid_keepalive_status_t *status)
+{
+    if (!status) return;
+    memset(status, 0, sizeof(*status));
+    if (s_keepalive_lock) xSemaphoreTake(s_keepalive_lock, portMAX_DELAY);
+    status->enabled = s_keepalive_enabled;
+    status->interval_s = s_keepalive_interval_s;
+    status->sent_count = s_keepalive_sent_count;
+    strlcpy(status->key, s_keepalive_key, sizeof(status->key));
+    strlcpy(status->message, s_keepalive_message, sizeof(status->message));
+    if (s_keepalive_lock) xSemaphoreGive(s_keepalive_lock);
+
+    status->dry_run = s_dry_run;
+    status->ready = usb_hid_device_ready();
+    usb_hid_exec_status_t exec_status;
+    usb_hid_executor_get_status(&exec_status);
+    status->paused = s_macro_reserved || s_executing ||
+                     exec_status.state == USB_HID_EXEC_RUNNING ||
+                     exec_status.state == USB_HID_EXEC_STOPPING;
 }
 
 static bool command_supported_for_real(const char *command)
@@ -1368,6 +1509,37 @@ static void run_macro_real(const usb_hid_macro_t *macro)
         bool finish = false;
         esp_err_t ret = ESP_OK;
         if (command_from_line(line_buf, command, sizeof(command), &args)) {
+            if (strcmp(command, "DELAY") == 0) {
+                set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "Delay");
+                uint32_t wait_ms = compute_delay_arg_ms(args, &ctx.eval);
+                TickType_t delay_ticks = pdMS_TO_TICKS(wait_ms);
+                if (delay_ticks == 0) delay_ticks = 1;
+                TickType_t end_tick = xTaskGetTickCount() + delay_ticks;
+                while ((int32_t)(end_tick - xTaskGetTickCount()) > 0) {
+                    if (s_stop_requested) {
+                        usb_hid_device_release();
+                        set_status(USB_HID_EXEC_DONE, macro, line_no, total, "Stopped");
+                        free(loop_counts);
+                        free(lines);
+                        return;
+                    }
+                    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                    if (now - started > USB_HID_EXEC_MAX_RUNTIME_MS) {
+                        usb_hid_device_release();
+                        set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "Runtime limit reached");
+                        free(loop_counts);
+                        free(lines);
+                        return;
+                    }
+                    TickType_t remaining = end_tick - xTaskGetTickCount();
+                    TickType_t slice = pdMS_TO_TICKS(50);
+                    if (slice == 0) slice = 1;
+                    if (remaining < slice) slice = remaining;
+                    vTaskDelay(slice);
+                }
+                pc++;
+                continue;
+            }
             if (strcmp(command, "IF") == 0) {
                 char expr[192];
                 strlcpy(expr, args, sizeof(expr));
@@ -1600,17 +1772,131 @@ static void run_macro_real(const usb_hid_macro_t *macro)
     free(lines);
 }
 
+static void keepalive_set_message(const char *message)
+{
+    if (!message) return;
+    if (s_keepalive_lock) xSemaphoreTake(s_keepalive_lock, portMAX_DELAY);
+    strlcpy(s_keepalive_message, message, sizeof(s_keepalive_message));
+    if (s_keepalive_lock) xSemaphoreGive(s_keepalive_lock);
+}
+
+static void keepalive_get_config(bool *enabled, uint16_t *interval_s,
+                                 char *key, size_t key_size)
+{
+    if (s_keepalive_lock) xSemaphoreTake(s_keepalive_lock, portMAX_DELAY);
+    if (enabled) *enabled = s_keepalive_enabled;
+    if (interval_s) *interval_s = s_keepalive_interval_s;
+    if (key && key_size > 0) strlcpy(key, s_keepalive_key, key_size);
+    if (s_keepalive_lock) xSemaphoreGive(s_keepalive_lock);
+}
+
+static bool keepalive_is_macro_active(void)
+{
+    usb_hid_exec_status_t status;
+    usb_hid_executor_get_status(&status);
+    return s_macro_reserved || s_executing ||
+           status.state == USB_HID_EXEC_RUNNING ||
+           status.state == USB_HID_EXEC_STOPPING;
+}
+
+static void keepalive_task(void *arg)
+{
+    (void)arg;
+    TickType_t next_due = 0;
+    uint16_t last_interval_s = 0;
+    char last_key[USB_HID_KEEPALIVE_KEY_LEN] = {0};
+    while (1) {
+        bool enabled = false;
+        uint16_t interval_s = 60;
+        char key_name[USB_HID_KEEPALIVE_KEY_LEN];
+        keepalive_get_config(&enabled, &interval_s, key_name, sizeof(key_name));
+
+        if (!enabled) {
+            next_due = 0;
+            last_interval_s = 0;
+            last_key[0] = '\0';
+            keepalive_set_message("Disabled");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        TickType_t now = xTaskGetTickCount();
+        TickType_t interval_ticks = pdMS_TO_TICKS((uint32_t)interval_s * 1000U);
+        if (interval_ticks == 0) interval_ticks = pdMS_TO_TICKS(1000);
+        if (next_due == 0 || last_interval_s != interval_s || strcmp(last_key, key_name) != 0) {
+            next_due = now + interval_ticks;
+            last_interval_s = interval_s;
+            strlcpy(last_key, key_name, sizeof(last_key));
+        }
+
+        int32_t ticks_until_due = (int32_t)(next_due - now);
+        if (ticks_until_due > 0) {
+            TickType_t sleep_ticks = ticks_until_due > pdMS_TO_TICKS(1000) ?
+                                     pdMS_TO_TICKS(1000) : (TickType_t)ticks_until_due;
+            vTaskDelay(sleep_ticks);
+            continue;
+        }
+        next_due = now + interval_ticks;
+
+        if (s_dry_run) {
+            keepalive_set_message("Dry run: periodic key not sent");
+            continue;
+        }
+        if (keepalive_is_macro_active()) {
+            keepalive_set_message("Paused while macro is running");
+            continue;
+        }
+        if (!usb_hid_device_ready()) {
+            keepalive_set_message("USB HID host is not ready");
+            continue;
+        }
+
+        usb_hid_key_t key;
+        if (!keepalive_key_from_name(key_name, &key)) {
+            keepalive_set_message("Invalid keep-awake key");
+            continue;
+        }
+
+        if (!s_hid_io_lock || xSemaphoreTake(s_hid_io_lock, 0) != pdTRUE) {
+            keepalive_set_message("Paused while HID output is busy");
+            continue;
+        }
+        if (keepalive_is_macro_active()) {
+            xSemaphoreGive(s_hid_io_lock);
+            keepalive_set_message("Paused while macro is running");
+            continue;
+        }
+
+        esp_err_t ret = send_key(0, &key);
+        xSemaphoreGive(s_hid_io_lock);
+        if (ret == ESP_OK) {
+            if (s_keepalive_lock) xSemaphoreTake(s_keepalive_lock, portMAX_DELAY);
+            s_keepalive_sent_count++;
+            snprintf(s_keepalive_message, sizeof(s_keepalive_message),
+                     "Sent %s (%lu)", key_name, (unsigned long)s_keepalive_sent_count);
+            if (s_keepalive_lock) xSemaphoreGive(s_keepalive_lock);
+        } else {
+            char message[96];
+            snprintf(message, sizeof(message), "Keep-awake send failed: %s", esp_err_to_name(ret));
+            keepalive_set_message(message);
+        }
+    }
+}
+
 static void executor_task(void *arg)
 {
     (void)arg;
     usb_hid_exec_request_t *req = NULL;
     while (1) {
         if (xQueueReceive(s_queue, &req, portMAX_DELAY) == pdTRUE) {
+            s_macro_reserved = false;
             s_executing = true;
             if (s_dry_run) {
                 run_macro_dry(&req->macro);
             } else {
+                if (s_hid_io_lock) xSemaphoreTake(s_hid_io_lock, portMAX_DELAY);
                 run_macro_real(&req->macro);
+                if (s_hid_io_lock) xSemaphoreGive(s_hid_io_lock);
             }
             s_executing = false;
             free(req);
@@ -1633,6 +1919,10 @@ esp_err_t usb_hid_executor_init(void)
 
     s_lock = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_lock != NULL, ESP_ERR_NO_MEM, TAG, "status lock allocation failed");
+    s_keepalive_lock = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_keepalive_lock != NULL, ESP_ERR_NO_MEM, TAG, "keepalive lock allocation failed");
+    s_hid_io_lock = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_hid_io_lock != NULL, ESP_ERR_NO_MEM, TAG, "HID I/O lock allocation failed");
 
     s_queue = xQueueCreate(USB_HID_EXEC_QUEUE_LEN, sizeof(usb_hid_exec_request_t *));
     ESP_RETURN_ON_FALSE(s_queue != NULL, ESP_ERR_NO_MEM, TAG, "queue allocation failed");
@@ -1640,6 +1930,9 @@ esp_err_t usb_hid_executor_init(void)
     BaseType_t ok = xTaskCreatePinnedToCore(executor_task, "usb_hid_exec", USB_HID_EXEC_TASK_STACK,
                                             NULL, 20, NULL, 1);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "task allocation failed");
+    ok = xTaskCreatePinnedToCore(keepalive_task, "usb_hid_keepalive", USB_HID_KEEPALIVE_TASK_STACK,
+                                 NULL, 10, NULL, 1);
+    ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "keepalive task allocation failed");
 
     set_status(USB_HID_EXEC_IDLE, NULL, 0, 0, s_dry_run ? "Idle (dry run)" : "Idle");
     return ESP_OK;
@@ -1651,7 +1944,8 @@ esp_err_t usb_hid_executor_start(const usb_hid_macro_t *macro)
 
     usb_hid_exec_status_t status;
     usb_hid_executor_get_status(&status);
-    if (status.state == USB_HID_EXEC_RUNNING || status.state == USB_HID_EXEC_STOPPING) {
+    if (status.state == USB_HID_EXEC_RUNNING || status.state == USB_HID_EXEC_STOPPING ||
+        s_macro_reserved || s_executing) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1659,7 +1953,9 @@ esp_err_t usb_hid_executor_start(const usb_hid_macro_t *macro)
     if (!req) return ESP_ERR_NO_MEM;
     req->macro = *macro;
     s_stop_requested = false;
+    s_macro_reserved = true;
     if (xQueueSend(s_queue, &req, 0) != pdTRUE) {
+        s_macro_reserved = false;
         free(req);
         return ESP_ERR_INVALID_STATE;
     }
@@ -1691,6 +1987,7 @@ esp_err_t usb_hid_executor_panic_stop(void)
         }
         xQueueReset(s_queue);
     }
+    s_macro_reserved = false;
 
     esp_err_t release_ret = usb_hid_device_release_best_effort(USB_HID_EXEC_PANIC_RELEASE_MS);
 

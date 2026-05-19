@@ -26,36 +26,79 @@ Toda la configuración se realiza a través de una interfaz web responsiva servi
 - **Subnet Router** — Anuncia rutas LAN y permite acceso `Tailscale -> LAN` mediante SNAT.
 
 ### ⌨️ Ejecutor USB HID (DuckyScript)
-- **Parser DuckyScript** — Soporte completo de sintaxis DuckyScript 3.0.
-- **Salida HID Real** — Ejecución de pulsaciones de teclas reales en el equipo objetivo.
-- **Modo Dry-Run** — Los comandos lógicos avanzados (bucles, variables) se validan y simulan en la UI pero no generan salida HID real todavía.
+- **Parser DuckyScript** — Soporte del conjunto de comandos listado abajo.
+- **Salida HID Real** — Ejecución de pulsaciones, variables runtime, expresiones, condicionales, bucles, funciones, delay por defecto y jitter.
+- **Modo Dry-Run** — Se usa automáticamente cuando TinyUSB HID no está disponible; los comandos de hardware/modo USB siguen siendo solo validación y se omiten en dry-run.
 - **Almacenamiento** — Hasta 12 macros en memoria flash.
-- **Multi-layout** — Soporte para más de 20 distribuciones de teclado (incluyendo ES).
+- **Pulso Keep Awake** — Envío periódico opcional de una tecla USB HID para reducir la aparición de la pantalla de bloqueo del host. El usuario elige tecla e intervalo; se pausa mientras una macro está en cola o ejecutándose.
+- **Multi-layout** — Soporte para ES, US, UK, LATAM, FR, DE, IT, PT, BR, Nordic, BE, TR, PL, CZ, SK, HU, RO, HR, SR, SL, BG, RU, UA, ZH y TW.
 
 ### 📅 Programador (Scheduler)
 - **Reglas Horarias** — Control automático de WiFi y VPN basado en la hora (NTP).
+- **Macros USB HID programadas** — En modo `Scheduled`, cada regla puede ejecutar opcionalmente una macro USB HID guardada una vez cuando la regla pasa a estar activa.
 
 ## Comandos DuckyScript Soportados
 
-Los siguientes comandos generan **Salida HID Real** (se envían al PC):
+Los siguientes comandos tienen **ejecución HID/runtime real** cuando el dispositivo USB HID está listo:
 
 | Comando | Función | Ejemplo |
 |---|---|---|
-| `REM` | Comentario | `REM Comentario` |
-| `STRING` | Escribe texto | `STRING Hola` |
-| `STRINGLN` | Texto + ENTER | `STRINGLN Hola` |
-| `DELAY` | Pausa en ms | `DELAY 1000` |
+| `REM`, `//`, `END_REM` | Comentarios | `REM Comentario` |
+| `STRING`, `STRINGLN` | Escribe texto, con interpolación de `$VAR` y `#DEFINE` | `STRINGLN Hola $NAME` |
+| `DELAY` | Pausa en ms o resultado de expresión | `DELAY RANDOM_INT(200,800)` |
+| `DEFAULT_DELAY`, `DEFAULTDELAY` | Añade pausa tras comandos físicos | `DEFAULT_DELAY 50` |
+| `JITTER` | Añade variación aleatoria al delay | `JITTER 25` |
+| `VAR`, `DEFINE` | Variables y defines runtime | `VAR $N = RANDOM_INT(1,5)` |
+| `IF`, `ELSE`, `END_IF` | Ejecución condicional | `IF $N > 2 THEN` |
+| `WHILE`, `END_WHILE`, `BREAK`, `CONTINUE` | Bucles runtime | `WHILE $N < 5` |
+| `LOOP` | Reinicia el payload, opcionalmente con contador | `LOOP 3` |
+| `FUNCTION`, `END_FUNCTION`, `RETURN`, `NAME()` | Llamadas simples a funciones | `OpenRun()` |
 | `ENTER`, `TAB`, `ESCAPE`, `SPACE` | Teclas estándar | `ENTER` |
 | `BACKSPACE`, `DELETE`, `INSERT` | Edición | `BACKSPACE` |
 | `HOME`, `END`, `PAGEUP`, `PAGEDOWN`| Navegación | `HOME` |
-| `UPARROW`, `DOWNARROW`, etc. | Flechas | `UPARROW` |
-| `CTRL`, `ALT`, `SHIFT`, `GUI` | Modificadores / Combos | `CTRL ALT DELETE` |
+| `UPARROW`, `DOWNARROW`, `LEFTARROW`, `RIGHTARROW` | Flechas | `UPARROW` |
+| `UP`, `DOWN`, `LEFT`, `RIGHT`, `ESC`, `CONTROL`, `OPTION` | Alias runtime | `ESC` |
+| `PRINTSCREEN`, `PAUSE`, `MENU` | Teclas adicionales | `PRINTSCREEN` |
+| `CTRL`, `ALT`, `SHIFT`, `GUI`, `WINDOWS`, `COMMAND` | Modificadores / combos | `CTRL ALT DELETE` |
 | `F1`–`F12` | Teclas de función | `F5` |
 | `HOLD` / `RELEASE` | Mantener modificadores| `HOLD CTRL` |
 | `STOP_PAYLOAD` | Detiene el script | `STOP_PAYLOAD` |
 
-Los siguientes comandos se validan pero operan en **Modo Dry-Run** (simulación):
-`JITTER`, `ATTACKMODE`, `VAR`, `DEFINE`, `IF/ELSE`, `WHILE`, `LOOP`, `FUNCTION`, `RANDOM_INT`, `LED`, `EXFIL`, `WAIT_FOR_BUTTON_PRESS`.
+Los siguientes comandos se parsean y validan, pero siguen en **dry-run / omitidos / solo validación**:
+`ATTACKMODE`, `SAVE_ATTACKMODE`, `RESTORE_ATTACKMODE`, `WAIT_FOR_BUTTON_PRESS`, `LED`, `CAPSLOCK`, `NUMLOCK`, `SCROLLLOCK`, `EXFIL`, `INJECT_MOD` y `RESTART_PAYLOAD`.
+
+USB HID **Keep Awake** se configura separado de las macros DuckyScript. Puede enviar periódicamente `SCROLLLOCK`, `PAUSE`/`BREAK`, `CAPSLOCK`, `NUMLOCK`, `PRINTSCREEN`, `MENU` o `F1`-`F12` cada 5-3600 segundos. Si una macro está en cola o ejecutándose, Keep Awake se pausa automáticamente y se reanuda en el siguiente intervalo si sigue activado.
+
+Las variables internas reconocidas son `$_CAPSLOCK_ON`, `$_NUMLOCK_ON`, `$_SCROLLLOCK_ON`, `$_CURRENT_VID`, `$_CURRENT_PID`, `$_BUTTON_ENABLED` y `$_HOST_CONFIGURATION_REQUEST_COUNT`. El runtime HID actual resuelve los estados de bloqueo de teclado y el placeholder del botón; VID/PID están reconocidas por el parser, pero el ejecutor aún no las resuelve.
+
+## Uso del Scheduler
+
+La pestaña **Scheduler** controla automatizaciones basadas en hora. Las reglas
+solo se aplican cuando el modo de operación está en **Scheduled**; en
+**Always on**, las reglas quedan guardadas pero no se ejecutan.
+
+1. Abre la pestaña **Scheduler**.
+2. Comprueba la zona horaria y pulsa **Sync now** si la hora del dispositivo no está sincronizada.
+3. Selecciona **Scheduled** en **Operating Mode**.
+4. Pulsa **Add rule** y configura:
+   - días de la semana,
+   - hora de inicio y fin,
+   - estados AP / STA / Tailscale,
+   - macro **USB HID** guardada opcional.
+5. Pulsa **Apply scheduler**.
+
+Las reglas del scheduler son semanales, no temporizadores de un solo uso. Una
+regla marcada para martes se ejecutará todos los martes hasta que se cambie o se
+desactive.
+
+Cuando una regla tiene seleccionada una macro USB HID, la macro se ejecuta **una
+vez cuando esa regla pasa a estar activa**. No se repite continuamente durante
+la ventana activa. Si el dispositivo arranca o se aplica la configuración del
+scheduler cuando ya está dentro de una ventana activa, la macro también se
+encola una vez para esa ventana.
+
+Usa **No macro** cuando la regla solo deba controlar el estado de AP / STA /
+Tailscale.
 
 ## API REST
 
@@ -87,9 +130,11 @@ Todos los endpoints requieren **HTTP Basic Auth** (por defecto: `admin`/`admin`)
 | | `POST` | `/api/usb-hid/execute` | Ejecutar script (Simulación o HID) |
 | | `POST` | `/api/usb-hid/stop` | Detener ejecución de forma segura |
 | | `POST` | `/api/usb-hid/panic` | Parada de emergencia y liberación |
+| | `GET` | `/api/usb-hid/keepalive` | Consultar estado y contadores de Keep Awake |
+| | `POST` | `/api/usb-hid/keepalive` | Configurar tecla e intervalo periódico de Keep Awake |
 | **Scheduler**| `GET` | `/api/scheduler/status` | Estado y próximo evento |
-| | `GET` | `/api/scheduler/config` | Obtener reglas de programación |
-| | `POST` | `/api/scheduler/config` | Actualizar reglas de programación |
+| | `GET` | `/api/scheduler/config` | Obtener reglas, incluyendo `usb_hid_macro_id` opcional por regla |
+| | `POST` | `/api/scheduler/config` | Actualizar reglas y validar IDs de macros programadas |
 | | `POST` | `/api/scheduler/sync` | Forzar sincronización NTP |
 | **Config** | `GET` | `/api/config` | Obtener configuración global |
 | | `POST` | `/api/config` | Actualizar configuración global |
@@ -137,4 +182,3 @@ Esta herramienta ha sido creada exclusivamente con fines **educativos y de audit
 Este proyecto está bajo la licencia **MIT**. Consulta el archivo [LICENSE](LICENSE) para más detalles.
 
 Copyright (c) 2026 soyunomas
-

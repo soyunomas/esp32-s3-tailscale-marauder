@@ -1,5 +1,17 @@
 # USB HID Macro Plan
 
+## Scheduler UX And USB HID Macro Scheduling
+
+- [x] Remove the preconfigured scheduler shortcut/button labeled `Work 14-16`.
+- [x] Do not ship preconfigured scheduler rules; `Add rule` must create a neutral editable rule, not a work-hours preset.
+- [x] Preserve all existing scheduler functionality: modes, timezone/NTP sync, AP/STA/Tailscale rule toggles, safety hold, save/load API behavior, and max 8 rules.
+- [x] Add scheduled execution for saved USB HID macros without routing execution through LLMs or deterministic model decisions.
+- [x] UX requirement: make macro scheduling explicit and reviewable inside each scheduler rule, with no hidden auto-execution defaults.
+- [x] Validate that a scheduled macro references an existing saved macro and fails loudly on invalid input.
+- [x] Avoid repeated macro execution while a schedule rule remains continuously active; trigger at the scheduled start/activation boundary.
+- [x] Keep USB HID executor serialization and stop/panic behavior intact.
+- [x] Update README.md and README-ESP.md after implementation with the scheduler macro execution behavior.
+
 ## Mandatory Guardrails
 
 - Do not change existing routing, captive portal, WiFi repeater behavior, Tailscale, scheduler behavior, NAPT, port forwarding, DNS, authentication, OTA, or logging internals unless the user explicitly approves a separate task.
@@ -194,3 +206,10 @@
 ## Maintenance Checkpoints
 
 - [x] 2026-05-19: Synced `firmware/wifi_repeater.bin` from `build/wifi_repeater.bin` after SHA-256 mismatch; all four firmware artifacts now match their build outputs.
+- [x] 2026-05-19: Fixed scheduled USB HID trigger semantics: macros now run once when a rule becomes active, not only on exact `start_min`; UI warns when rules are configured while mode is `Always on`.
+- [x] 2026-05-19: Documented Scheduler usage in README.md and README-ESP.md, including `Scheduled` mode, weekly rules, and one-shot-per-window USB HID macro execution.
+- [x] 2026-05-19: Synced release firmware artifacts before GitHub upload; `firmware/wifi_repeater.bin` SHA-256 now matches `build/wifi_repeater.bin` (`e6b5c047e54e04c48afa9b899fc41542e3261c2b8e540fe3f9e0919e0076042e`).
+- [x] 2026-05-19: Added optional USB HID Keep Awake pulse with persistent key/interval config, `/api/usb-hid/keepalive`, UI controls, and executor-side pausing while macros are queued or running.
+- [x] 2026-05-19: Fixed real HID `DELAY` waiting to use tick-based waits and verified on-device that Keep Awake pauses during a running macro, then restored Keep Awake disabled.
+- [x] 2026-05-20: Suppressed the noisy `tusb_desc` TinyUSB descriptor table in runtime logs while keeping TinyUSB/HID errors visible.
+- [x] 2026-05-20: Synced `firmware/wifi_repeater.bin` after log cleanup; SHA-256 matches `build/wifi_repeater.bin` (`ffe894a53911dafdbd580150eff58fe1c83ca0b7b90c814c4c6ef2db3ce7ba6f`).

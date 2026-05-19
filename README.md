@@ -29,14 +29,16 @@ All configuration is done via an embedded responsive web UI served directly from
 - **DERP Relay Support** — Connectivity even behind restrictive firewalls.
 
 ### ⌨️ USB HID Executor (DuckyScript)
-- **DuckyScript Parser** — Full parser support for DuckyScript 3.0 syntax.
-- **Real HID Output** — Execution of core keystroke commands on target machines.
-- **Dry-Run Mode** — Advanced logic commands (logic, variables) are validated and simulated in the Web UI without sending HID reports.
+- **DuckyScript Parser** — Parser support for the command set listed below.
+- **Real HID Output** — Execution of keystrokes plus runtime variables, expressions, branching, loops, functions, default delays, and jitter.
+- **Dry-Run Mode** — Used automatically when TinyUSB HID is unavailable; hardware/USB-mode commands remain validation-only and are skipped in dry-run.
 - **Macro Storage** — Save up to 12 custom macros in non-volatile memory.
-- **Multi-layout Support** — Support for 20+ keyboard layouts including ES, US, UK, FR, DE, etc.
+- **Keep Awake Key Pulse** — Optional periodic USB HID key pulse to reduce host lock-screen activation. The user selects the key and interval; it pauses while any macro is queued or running.
+- **Multi-layout Support** — Support for ES, US, UK, LATAM, FR, DE, IT, PT, BR, Nordic, BE, TR, PL, CZ, SK, HU, RO, HR, SR, SL, BG, RU, UA, ZH, and TW layouts.
 
 ### 📅 Smart Scheduler
 - **Time-based Rules** — Schedule when AP, STA, or Tailscale should be active.
+- **Scheduled USB HID Macros** — In `Scheduled` mode, each rule can optionally run one saved USB HID macro once when the rule becomes active.
 - **NTP Sync** — Automatic time synchronization for precise execution.
 
 ### 💻 Web UI
@@ -46,27 +48,65 @@ All configuration is done via an embedded responsive web UI served directly from
 
 ## Supported DuckyScript Commands
 
-The following commands are supported for **Real HID Output** (actually sent to the host):
+The following commands are supported for **real HID/runtime execution** when the USB HID device is ready:
 
 | Command | Function | Example |
 |---|---|---|
-| `REM` | One-line comment | `REM Comment` |
-| `STRING` | Type text | `STRING Hello World` |
-| `STRINGLN` | Type text + ENTER | `STRINGLN Hello World` |
-| `DELAY` | Wait in ms | `DELAY 1000` |
+| `REM`, `//`, `END_REM` | Comments | `REM Comment` |
+| `STRING`, `STRINGLN` | Type text, with `$VAR` and `#DEFINE` interpolation | `STRINGLN Hello $NAME` |
+| `DELAY` | Wait in ms or expression result | `DELAY RANDOM_INT(200,800)` |
+| `DEFAULT_DELAY`, `DEFAULTDELAY` | Add delay after physical commands | `DEFAULT_DELAY 50` |
+| `JITTER` | Add random delay variation | `JITTER 25` |
+| `VAR`, `DEFINE` | Runtime variables and defines | `VAR $N = RANDOM_INT(1,5)` |
+| `IF`, `ELSE`, `END_IF` | Conditional execution | `IF $N > 2 THEN` |
+| `WHILE`, `END_WHILE`, `BREAK`, `CONTINUE` | Runtime loops | `WHILE $N < 5` |
+| `LOOP` | Restart payload, optionally counted | `LOOP 3` |
+| `FUNCTION`, `END_FUNCTION`, `RETURN`, `NAME()` | Simple function calls | `OpenRun()` |
 | `ENTER`, `TAB`, `ESCAPE`, `SPACE` | Standard keys | `ENTER` |
 | `BACKSPACE`, `DELETE`, `INSERT` | Edit keys | `BACKSPACE` |
 | `HOME`, `END`, `PAGEUP`, `PAGEDOWN`| Navigation keys | `HOME` |
-| `UPARROW`, `DOWNARROW`, etc. | Arrow keys | `UPARROW` |
-| `CTRL`, `ALT`, `SHIFT`, `GUI` | Modifiers / Combos | `CTRL ALT DELETE` |
+| `UPARROW`, `DOWNARROW`, `LEFTARROW`, `RIGHTARROW` | Arrow keys | `UPARROW` |
+| `UP`, `DOWN`, `LEFT`, `RIGHT`, `ESC`, `CONTROL`, `OPTION` | Runtime aliases | `ESC` |
+| `PRINTSCREEN`, `PAUSE`, `MENU` | Extra keyboard keys | `PRINTSCREEN` |
+| `CTRL`, `ALT`, `SHIFT`, `GUI`, `WINDOWS`, `COMMAND` | Modifiers / combos | `CTRL ALT DELETE` |
 | `F1`–`F12` | Function keys | `F5` |
 | `HOLD` / `RELEASE` | Persistent modifiers | `HOLD CTRL` |
 | `STOP_PAYLOAD` | Stop current script | `STOP_PAYLOAD` |
 
-The following commands are parsed and validated but currently operate in **Dry-Run Mode** (Simulation in UI only):
-`JITTER`, `ATTACKMODE`, `VAR`, `DEFINE`, `IF/ELSE`, `WHILE`, `LOOP`, `FUNCTION`, `RANDOM_INT`, `LED`, `EXFIL`, `WAIT_FOR_BUTTON_PRESS`.
+The following commands are parsed and validated but currently remain **dry-run / skipped / validation-only**:
+`ATTACKMODE`, `SAVE_ATTACKMODE`, `RESTORE_ATTACKMODE`, `WAIT_FOR_BUTTON_PRESS`, `LED`, `CAPSLOCK`, `NUMLOCK`, `SCROLLLOCK`, `EXFIL`, `INJECT_MOD`, and `RESTART_PAYLOAD`.
+
+USB HID **Keep Awake** is configured separately from DuckyScript macros. It can periodically send `SCROLLLOCK`, `PAUSE`/`BREAK`, `CAPSLOCK`, `NUMLOCK`, `PRINTSCREEN`, `MENU`, or `F1`-`F12` every 5-3600 seconds. When a macro is queued or running, Keep Awake pauses automatically and resumes on the next interval if still enabled.
+
+Recognized internal variables are `$_CAPSLOCK_ON`, `$_NUMLOCK_ON`, `$_SCROLLLOCK_ON`, `$_CURRENT_VID`, `$_CURRENT_PID`, `$_BUTTON_ENABLED`, and `$_HOST_CONFIGURATION_REQUEST_COUNT`. Current HID runtime resolves the lock-key states and button placeholder; VID/PID are parser-recognized but not resolved by the executor yet.
 
 ## Hardware: ESP32-S3 N16R8 (Required)
+
+## Scheduler Usage
+
+The **Scheduler** tab controls time-based automation. It only applies rules when
+the operating mode is set to **Scheduled**; in **Always on** mode, saved rules are
+kept but not executed.
+
+1. Open the **Scheduler** tab.
+2. Confirm the timezone and press **Sync now** if the device time is not synced.
+3. Select **Scheduled** in **Operating Mode**.
+4. Press **Add rule** and configure:
+   - days of the week,
+   - start and end time,
+   - AP / STA / Tailscale enabled states,
+   - optional saved **USB HID Macro**.
+5. Press **Apply scheduler**.
+
+Scheduler rules are weekly rules, not one-shot timers. A rule selected for
+Tuesday will run every Tuesday until changed or disabled.
+
+When a rule has a USB HID macro selected, the macro runs **once when that rule
+becomes active**. It does not repeat continuously during the active window. If
+the device boots or the scheduler config is applied while already inside an
+active rule window, the macro is also queued once for that active window.
+
+Use **No macro** when a rule should only control AP / STA / Tailscale state.
 
 ## REST API
 
@@ -98,9 +138,11 @@ All API endpoints require **HTTP Basic Auth** (default: `admin`/`admin`).
 | | `POST` | `/api/usb-hid/execute` | Run script (Dry-run or HID) |
 | | `POST` | `/api/usb-hid/stop` | Gracefully stop execution |
 | | `POST` | `/api/usb-hid/panic` | Emergency stop & release keys |
+| | `GET` | `/api/usb-hid/keepalive` | Get Keep Awake state and counters |
+| | `POST` | `/api/usb-hid/keepalive` | Configure periodic Keep Awake key and interval |
 | **Scheduler**| `GET` | `/api/scheduler/status` | Scheduler state & next event |
-| | `GET` | `/api/scheduler/config` | Get scheduling rules |
-| | `POST` | `/api/scheduler/config` | Update scheduling rules |
+| | `GET` | `/api/scheduler/config` | Get scheduling rules, including optional `usb_hid_macro_id` per rule |
+| | `POST` | `/api/scheduler/config` | Update scheduling rules and validate scheduled macro IDs |
 | | `POST` | `/api/scheduler/sync` | Force NTP time sync |
 | **Config** | `GET` | `/api/config` | Get global device config |
 | | `POST` | `/api/config` | Update global device config |

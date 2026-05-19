@@ -39,17 +39,26 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_manager_init(&s_config));
     ESP_ERROR_CHECK(wifi_manager_start());
 
-    // Start time sync and scheduler after WiFi is up. Scheduler keeps AP on
-    // until time is valid, then applies temporary automation state.
-    ESP_ERROR_CHECK(scheduler_manager_init(&s_config));
-
     // Start the isolated USB HID macro executor. This feature must never
     // prevent the existing web UI, captive portal, WiFi, or Tailscale paths
     // from booting.
     esp_err_t usb_hid_ret = usb_hid_executor_init();
     if (usb_hid_ret != ESP_OK) {
         ESP_LOGE(TAG, "USB HID executor disabled: %s", esp_err_to_name(usb_hid_ret));
+    } else {
+        esp_err_t keepalive_ret = usb_hid_executor_configure_keepalive(
+            s_config.usb_hid_keepalive_enabled,
+            s_config.usb_hid_keepalive_key,
+            s_config.usb_hid_keepalive_interval_s);
+        if (keepalive_ret != ESP_OK) {
+            ESP_LOGE(TAG, "USB HID keep-awake config rejected: %s", esp_err_to_name(keepalive_ret));
+        }
     }
+
+    // Start time sync and scheduler after WiFi is up and after the optional
+    // HID executor is ready, so scheduled macros cannot fire before their
+    // executor queue exists.
+    ESP_ERROR_CHECK(scheduler_manager_init(&s_config));
 
     // Start web server
     ESP_ERROR_CHECK(web_server_start(&s_config));

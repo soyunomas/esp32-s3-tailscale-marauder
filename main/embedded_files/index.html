@@ -436,6 +436,48 @@
         <span class="usb-hid-label">Status</span>
         <div class="usb-hid-status" id="usbHidStatus">Idle</div>
       </div>
+      <div class="usb-hid-card">
+        <div class="usb-hid-card-head">
+          <span class="usb-hid-label">Keep Awake</span>
+          <label class="toggle-label usb-hid-toggle">
+            <input id="usbHidKeepaliveEnabled" type="checkbox">
+            Enabled
+          </label>
+        </div>
+        <div class="usb-hid-keepalive-grid">
+          <div>
+            <label class="usb-hid-label" for="usbHidKeepaliveKey">Key</label>
+            <select class="usb-hid-input" id="usbHidKeepaliveKey">
+              <option value="SCROLLLOCK">Scroll Lock</option>
+              <option value="PAUSE">Pause/Break</option>
+              <option value="CAPSLOCK">Caps Lock</option>
+              <option value="NUMLOCK">Num Lock</option>
+              <option value="PRINTSCREEN">Print Screen</option>
+              <option value="MENU">Menu</option>
+              <option value="F1">F1</option>
+              <option value="F2">F2</option>
+              <option value="F3">F3</option>
+              <option value="F4">F4</option>
+              <option value="F5">F5</option>
+              <option value="F6">F6</option>
+              <option value="F7">F7</option>
+              <option value="F8">F8</option>
+              <option value="F9">F9</option>
+              <option value="F10">F10</option>
+              <option value="F11">F11</option>
+              <option value="F12">F12</option>
+            </select>
+          </div>
+          <div>
+            <label class="usb-hid-label" for="usbHidKeepaliveInterval">Every Seconds</label>
+            <input class="usb-hid-input" id="usbHidKeepaliveInterval" type="number" min="5" max="3600" step="1" value="60">
+          </div>
+        </div>
+        <div class="usb-hid-actions usb-hid-keepalive-actions">
+          <button class="btn btn-secondary btn-sm" id="usbHidKeepaliveSave" type="button">Save Keep Awake</button>
+        </div>
+        <div class="usb-hid-status usb-hid-keepalive-status" id="usbHidKeepaliveStatus">Disabled</div>
+      </div>
       <div class="usb-hid-card usb-hid-saved-card">
         <div class="usb-hid-card-head">
           <span class="usb-hid-label">Saved Macros</span>
@@ -510,7 +552,6 @@
         <button class="btn btn-secondary btn-sm" onclick="addSchedulerRule()">Add rule</button>
       </div>
       <div class="sched-toolbar">
-        <button class="btn btn-secondary btn-sm" onclick="addWorkAccessRule()">Work 14-16</button>
         <button class="btn btn-secondary btn-sm" onclick="clearSchedulerRules()">Clear rules</button>
       </div>
       <div id="schedRules" class="sched-rules"></div>

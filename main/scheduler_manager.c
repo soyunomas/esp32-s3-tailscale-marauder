@@ -1,6 +1,8 @@
 #include "scheduler_manager.h"
 #include "wifi_manager.h"
 #include "tailscale_manager.h"
+#include "usb_hid_executor.h"
+#include "usb_hid_macro_store.h"
 #include "esp_log.h"
 #include "esp_sntp.h"
 #include "freertos/FreeRTOS.h"
@@ -24,6 +26,10 @@ static bool s_last_tailscale_effective = true;
 static bool s_last_tailscale_desired = true;
 static bool s_last_safety_hold = false;
 static int s_last_active_rule = -1;
+static int s_last_macro_trigger_rule = -1;
+static int s_last_macro_trigger_yday = -1;
+static uint16_t s_last_macro_trigger_min = UINT16_MAX;
+static uint32_t s_last_macro_trigger_id = 0;
 static char s_last_reason[SCHED_REASON_LEN] = "Always on";
 
 static void scheduler_lock(void)
@@ -152,6 +158,62 @@ static void start_sntp_locked(void)
     ESP_LOGI(TAG, "SNTP started");
 }
 
+static bool scheduled_macro_due_locked(time_t now, int previous_active_rule,
+                                       int active_rule,
+                                       uint32_t *macro_id_out)
+{
+    if (!s_config || s_config->sched_mode != SCHED_MODE_SCHEDULED) return false;
+    if (active_rule < 0 || active_rule >= CFG_SCHED_RULES_MAX) return false;
+    if (active_rule == previous_active_rule) return false;
+
+    const scheduler_rule_t *rule = &s_config->sched_rules[active_rule];
+    if (rule->usb_hid_macro_id == 0) return false;
+
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+
+    if (s_last_macro_trigger_rule == active_rule &&
+        s_last_macro_trigger_yday == tm_now.tm_yday &&
+        s_last_macro_trigger_min == rule->start_min &&
+        s_last_macro_trigger_id == rule->usb_hid_macro_id) {
+        return false;
+    }
+
+    s_last_macro_trigger_rule = active_rule;
+    s_last_macro_trigger_yday = tm_now.tm_yday;
+    s_last_macro_trigger_min = rule->start_min;
+    s_last_macro_trigger_id = rule->usb_hid_macro_id;
+    *macro_id_out = rule->usb_hid_macro_id;
+    return true;
+}
+
+static void trigger_scheduled_macro(uint32_t macro_id, int rule_index)
+{
+    usb_hid_macro_t *macro = calloc(1, sizeof(*macro));
+    if (!macro) {
+        ESP_LOGE(TAG, "Scheduled USB HID macro allocation failed for rule %d", rule_index + 1);
+        return;
+    }
+
+    esp_err_t ret = usb_hid_macro_store_get(macro_id, macro);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Scheduled USB HID macro %lu for rule %d not found: %s",
+                 (unsigned long)macro_id, rule_index + 1, esp_err_to_name(ret));
+        free(macro);
+        return;
+    }
+
+    ret = usb_hid_executor_start(macro);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Scheduled USB HID macro '%s' for rule %d failed to start: %s",
+                 macro->name, rule_index + 1, esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Scheduled USB HID macro '%s' queued by rule %d",
+                 macro->name, rule_index + 1);
+    }
+    free(macro);
+}
+
 static void scheduler_evaluate(void)
 {
     scheduler_lock();
@@ -160,7 +222,10 @@ static void scheduler_evaluate(void)
     bool sta_desired = true;
     bool tailscale_desired = true;
     int active_rule = -1;
+    int previous_active_rule = s_last_active_rule;
     const char *reason = "Always on";
+    uint32_t trigger_macro_id = 0;
+    int trigger_macro_rule = -1;
 
     if (!valid) {
         ap_desired = true;
@@ -199,6 +264,10 @@ static void scheduler_evaluate(void)
     }
 
     strlcpy(s_last_reason, reason, sizeof(s_last_reason));
+    if (valid && scheduled_macro_due_locked(time(NULL), previous_active_rule,
+                                            active_rule, &trigger_macro_id)) {
+        trigger_macro_rule = active_rule;
+    }
     s_last_ap_desired = ap_desired;
     s_last_ap_effective = ap_effective;
     s_last_sta_desired = sta_desired;
@@ -220,6 +289,9 @@ static void scheduler_evaluate(void)
     ret = tailscale_manager_set_scheduler_enabled(tailscale_effective);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to apply scheduled Tailscale state: %s", esp_err_to_name(ret));
+    }
+    if (trigger_macro_id != 0) {
+        trigger_scheduled_macro(trigger_macro_id, trigger_macro_rule);
     }
 }
 
