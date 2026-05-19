@@ -67,14 +67,14 @@ The following commands are supported for **real HID/runtime execution** when the
 | `HOME`, `END`, `PAGEUP`, `PAGEDOWN`| Navigation keys | `HOME` |
 | `UPARROW`, `DOWNARROW`, `LEFTARROW`, `RIGHTARROW` | Arrow keys | `UPARROW` |
 | `UP`, `DOWN`, `LEFT`, `RIGHT`, `ESC`, `CONTROL`, `OPTION` | Runtime aliases | `ESC` |
-| `PRINTSCREEN`, `PAUSE`, `MENU` | Extra keyboard keys | `PRINTSCREEN` |
+| `PRINTSCREEN`, `PAUSE`, `CAPSLOCK`, `NUMLOCK`, `SCROLLLOCK`, `MENU` | Extra keyboard keys | `SCROLLLOCK` |
 | `CTRL`, `ALT`, `SHIFT`, `GUI`, `WINDOWS`, `COMMAND` | Modifiers / combos | `CTRL ALT DELETE` |
 | `F1`–`F12` | Function keys | `F5` |
 | `HOLD` / `RELEASE` | Persistent modifiers | `HOLD CTRL` |
 | `STOP_PAYLOAD` | Stop current script | `STOP_PAYLOAD` |
 
-The following commands are parsed and validated but currently remain **dry-run / skipped / validation-only**:
-`ATTACKMODE`, `SAVE_ATTACKMODE`, `RESTORE_ATTACKMODE`, `WAIT_FOR_BUTTON_PRESS`, `LED`, `CAPSLOCK`, `NUMLOCK`, `SCROLLLOCK`, `EXFIL`, `INJECT_MOD`, and `RESTART_PAYLOAD`.
+The following commands are recognized for parser compatibility, but are intentionally **disabled at runtime / skipped / validation-only**:
+`ATTACKMODE`, `SAVE_ATTACKMODE`, `RESTORE_ATTACKMODE`, `WAIT_FOR_BUTTON_PRESS`, `LED`, `EXFIL`, `INJECT_MOD`, and `RESTART_PAYLOAD`.
 
 USB HID **Keep Awake** is configured separately from DuckyScript macros. It can periodically send `SCROLLLOCK`, `PAUSE`/`BREAK`, `CAPSLOCK`, `NUMLOCK`, `PRINTSCREEN`, `MENU`, or `F1`-`F12` every 5-3600 seconds. When a macro is queued or running, Keep Awake pauses automatically and resumes on the next interval if still enabled.
 

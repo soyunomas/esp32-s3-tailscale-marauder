@@ -783,6 +783,9 @@ static bool key_from_token(const char *token, const char *layout, usb_hid_key_t 
              strcasecmp(token, "RIGHT") == 0) key->keycode = HID_KEY_ARROW_RIGHT;
     else if (strcasecmp(token, "PRINTSCREEN") == 0) key->keycode = HID_KEY_PRINT_SCREEN;
     else if (strcasecmp(token, "PAUSE") == 0) key->keycode = HID_KEY_PAUSE;
+    else if (strcasecmp(token, "CAPSLOCK") == 0) key->keycode = HID_KEY_CAPS_LOCK;
+    else if (strcasecmp(token, "NUMLOCK") == 0) key->keycode = HID_KEY_NUM_LOCK;
+    else if (strcasecmp(token, "SCROLLLOCK") == 0) key->keycode = HID_KEY_SCROLL_LOCK;
     else if (strcasecmp(token, "MENU") == 0) key->keycode = HID_KEY_MENU;
     else if ((token[0] == 'F' || token[0] == 'f') && token[1] != '\0') {
         char *end = NULL;
@@ -915,7 +918,7 @@ static bool command_supported_for_real(const char *command)
         "IF", "ELSE", "END_IF", "WHILE", "END_WHILE", "BREAK", "CONTINUE",
         "ENTER", "TAB", "ESCAPE", "SPACE", "BACKSPACE", "DELETE", "INSERT",
         "HOME", "END", "PAGEUP", "PAGEDOWN",
-        "PRINTSCREEN", "PAUSE", "MENU",
+        "PRINTSCREEN", "PAUSE", "CAPSLOCK", "NUMLOCK", "SCROLLLOCK", "MENU",
         "UPARROW", "DOWNARROW", "LEFTARROW", "RIGHTARROW",
         "CTRL", "ALT", "SHIFT", "GUI", "WINDOWS", "COMMAND",
         "HOLD", "RELEASE", "STOP_PAYLOAD",

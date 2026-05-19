@@ -58,14 +58,14 @@ Los siguientes comandos tienen **ejecución HID/runtime real** cuando el disposi
 | `HOME`, `END`, `PAGEUP`, `PAGEDOWN`| Navegación | `HOME` |
 | `UPARROW`, `DOWNARROW`, `LEFTARROW`, `RIGHTARROW` | Flechas | `UPARROW` |
 | `UP`, `DOWN`, `LEFT`, `RIGHT`, `ESC`, `CONTROL`, `OPTION` | Alias runtime | `ESC` |
-| `PRINTSCREEN`, `PAUSE`, `MENU` | Teclas adicionales | `PRINTSCREEN` |
+| `PRINTSCREEN`, `PAUSE`, `CAPSLOCK`, `NUMLOCK`, `SCROLLLOCK`, `MENU` | Teclas adicionales | `SCROLLLOCK` |
 | `CTRL`, `ALT`, `SHIFT`, `GUI`, `WINDOWS`, `COMMAND` | Modificadores / combos | `CTRL ALT DELETE` |
 | `F1`–`F12` | Teclas de función | `F5` |
 | `HOLD` / `RELEASE` | Mantener modificadores| `HOLD CTRL` |
 | `STOP_PAYLOAD` | Detiene el script | `STOP_PAYLOAD` |
 
-Los siguientes comandos se parsean y validan, pero siguen en **dry-run / omitidos / solo validación**:
-`ATTACKMODE`, `SAVE_ATTACKMODE`, `RESTORE_ATTACKMODE`, `WAIT_FOR_BUTTON_PRESS`, `LED`, `CAPSLOCK`, `NUMLOCK`, `SCROLLLOCK`, `EXFIL`, `INJECT_MOD` y `RESTART_PAYLOAD`.
+Los siguientes comandos se reconocen por compatibilidad del parser, pero están intencionadamente **deshabilitados en runtime / omitidos / solo validación**:
+`ATTACKMODE`, `SAVE_ATTACKMODE`, `RESTORE_ATTACKMODE`, `WAIT_FOR_BUTTON_PRESS`, `LED`, `EXFIL`, `INJECT_MOD` y `RESTART_PAYLOAD`.
 
 USB HID **Keep Awake** se configura separado de las macros DuckyScript. Puede enviar periódicamente `SCROLLLOCK`, `PAUSE`/`BREAK`, `CAPSLOCK`, `NUMLOCK`, `PRINTSCREEN`, `MENU` o `F1`-`F12` cada 5-3600 segundos. Si una macro está en cola o ejecutándose, Keep Awake se pausa automáticamente y se reanuda en el siguiente intervalo si sigue activado.
 

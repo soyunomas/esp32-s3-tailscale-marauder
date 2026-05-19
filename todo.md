@@ -213,3 +213,6 @@
 - [x] 2026-05-19: Fixed real HID `DELAY` waiting to use tick-based waits and verified on-device that Keep Awake pauses during a running macro, then restored Keep Awake disabled.
 - [x] 2026-05-20: Suppressed the noisy `tusb_desc` TinyUSB descriptor table in runtime logs while keeping TinyUSB/HID errors visible.
 - [x] 2026-05-20: Synced `firmware/wifi_repeater.bin` after log cleanup; SHA-256 matches `build/wifi_repeater.bin` (`ffe894a53911dafdbd580150eff58fe1c83ca0b7b90c814c4c6ef2db3ce7ba6f`).
+- [x] 2026-05-20: Promoted DuckyScript `CAPSLOCK`, `NUMLOCK`, and `SCROLLLOCK` from validation-only to real HID execution.
+- [x] 2026-05-20: Synced `firmware/wifi_repeater.bin` after lock-key HID execution; SHA-256 matches `build/wifi_repeater.bin` (`f49bebb2cdc52a960f54f72755a86e58acb8de678ba4239342e5340f75d6e293`).
+- [x] 2026-05-20: Clarified README wording for parser-compatible commands that are intentionally disabled at runtime.
