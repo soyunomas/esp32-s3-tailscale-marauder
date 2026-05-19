@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c" "wifi_manager.c" "web_server.c" "config_storage.c" "log_buffer.c" "tailscale_manager.c" "factory_reset.c" "scheduler_manager.c" "usb_hid_macro_store.c" "usb_hid_macro_parser.c" "usb_hid_device.c" "usb_hid_executor.c"
+    SRCS "main.c" "wifi_manager.c" "web_server.c" "config_storage.c" "log_buffer.c" "tailscale_manager.c" "factory_reset.c" "scheduler_manager.c" "usb_hid_macro_store.c" "usb_hid_macro_parser.c" "usb_hid_device.c" "usb_hid_executor.c" "usb_hid_evaluator.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         esp_wifi

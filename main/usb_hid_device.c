@@ -19,6 +19,11 @@ static bool s_installed;
 static bool s_suspended;
 static bool s_wakeup_host;
 
+/* Host-pushed LED state from HID_REPORT_TYPE_OUTPUT.
+ * Single-byte volatile access is atomic on ESP32-S3 (LX7), no mutex required.
+ * Updated from the TinyUSB task (Core 1) and read from any task. */
+static volatile uint8_t s_led_state = 0;
+
 static const uint8_t s_hid_report_descriptor[] = {
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(USB_HID_REPORT_ID_KEYBOARD)),
 };
@@ -61,10 +66,31 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                            uint8_t const *buffer, uint16_t bufsize)
 {
     (void)instance;
-    (void)report_id;
-    (void)report_type;
-    (void)buffer;
-    (void)bufsize;
+    /* Host sends OUTPUT reports to update keyboard LEDs (CAPS/NUM/SCROLL/...).
+     * TinyUSB strips the report ID, so buffer[0] is the LED bitmap. */
+    if (report_type != HID_REPORT_TYPE_OUTPUT) return;
+    if (report_id != 0 && report_id != USB_HID_REPORT_ID_KEYBOARD) return;
+    if (buffer == NULL || bufsize == 0) return;
+
+    uint8_t leds = buffer[0];
+    /* Single-byte volatile store -- atomic on this MCU. */
+    s_led_state = leds;
+    ESP_LOGD(TAG, "Host LED state: 0x%02x (NUM=%d CAPS=%d SCROLL=%d)",
+             leds,
+             (leds & USB_HID_LED_NUMLOCK) ? 1 : 0,
+             (leds & USB_HID_LED_CAPSLOCK) ? 1 : 0,
+             (leds & USB_HID_LED_SCROLLLOCK) ? 1 : 0);
+}
+
+bool usb_hid_device_get_led_state(uint8_t led_mask)
+{
+    if (led_mask == 0) return false;
+    return (s_led_state & led_mask) == led_mask;
+}
+
+uint8_t usb_hid_device_get_led_byte(void)
+{
+    return s_led_state;
 }
 
 void tud_suspend_cb(bool remote_wakeup_en)

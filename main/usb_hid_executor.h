@@ -28,3 +28,8 @@ esp_err_t usb_hid_executor_stop(void);
 esp_err_t usb_hid_executor_panic_stop(void);
 void usb_hid_executor_get_status(usb_hid_exec_status_t *status);
 const char *usb_hid_exec_state_name(usb_hid_exec_state_t state);
+
+/* Resolve a DuckyScript internal variable (e.g. "$_CAPSLOCK_ON") to an integer.
+ * Returns true if recognized, false otherwise. Designed to be called from the
+ * Phase 3 expression evaluator. Safe to call from any FreeRTOS task. */
+bool usb_hid_executor_resolve_internal_var(const char *name, int *value_out);

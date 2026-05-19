@@ -50,7 +50,9 @@ static const usb_hid_command_spec_t s_commands[] = {
     {"END_REM", ARG_NONE},
     {"STRING", ARG_TEXT},
     {"STRINGLN", ARG_TEXT},
-    {"DELAY", ARG_NUMBER},
+    {"DELAY", ARG_EXPRESSION},
+    {"DEFAULT_DELAY", ARG_NUMBER},
+    {"DEFAULTDELAY", ARG_NUMBER},
     {"ENTER", ARG_NONE},
     {"TAB", ARG_NONE},
     {"ESCAPE", ARG_NONE},
@@ -62,6 +64,9 @@ static const usb_hid_command_spec_t s_commands[] = {
     {"END", ARG_NONE},
     {"PAGEUP", ARG_NONE},
     {"PAGEDOWN", ARG_NONE},
+    {"PRINTSCREEN", ARG_NONE},
+    {"PAUSE", ARG_NONE},
+    {"MENU", ARG_NONE},
     {"UPARROW", ARG_NONE},
     {"DOWNARROW", ARG_NONE},
     {"LEFTARROW", ARG_NONE},
@@ -210,6 +215,36 @@ static bool is_function_key(const char *command)
     return end && *end == '\0' && number >= 1 && number <= 12;
 }
 
+static bool is_function_call_command(const char *command)
+{
+    size_t len = command ? strlen(command) : 0;
+    if (len < 3 || command[len - 2] != '(' || command[len - 1] != ')') return false;
+    char name[32];
+    if (len - 2 >= sizeof(name)) return false;
+    memcpy(name, command, len - 2);
+    name[len - 2] = '\0';
+    return is_identifier(name);
+}
+
+static void normalize_command_alias(char *command)
+{
+    static const struct { const char *alias; const char *canonical; } aliases[] = {
+        {"UP", "UPARROW"},
+        {"DOWN", "DOWNARROW"},
+        {"LEFT", "LEFTARROW"},
+        {"RIGHT", "RIGHTARROW"},
+        {"ESC", "ESCAPE"},
+        {"CONTROL", "CTRL"},
+        {"OPTION", "ALT"},
+    };
+    for (size_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); i++) {
+        if (strcmp(command, aliases[i].alias) == 0) {
+            strlcpy(command, aliases[i].canonical, 32);
+            return;
+        }
+    }
+}
+
 static const usb_hid_command_spec_t *find_command(const char *command)
 {
     for (size_t i = 0; i < sizeof(s_commands) / sizeof(s_commands[0]); i++) {
@@ -268,6 +303,21 @@ static bool expression_valid(const char *value)
     return expression_balanced(value) && expression_internal_vars_known(value);
 }
 
+static bool string_assignment_valid(const char *value)
+{
+    if (!value || value[0] == '\0') return false;
+    size_t len = strlen(value);
+    if ((value[0] == '"' || value[0] == '\'') && len >= 2 && value[len - 1] == value[0]) {
+        return true;
+    }
+    for (size_t i = 0; value[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (isspace(c) || c < 0x20 || c > 0x7e) return false;
+        if (strchr("()+-*/%&|^<>=!", value[i])) return false;
+    }
+    return true;
+}
+
 static bool parse_number_in_range(const char *value, long min_value, long max_value, long *out)
 {
     if (!is_number_arg(value)) return false;
@@ -318,7 +368,9 @@ static usb_hid_parse_result_t validate_var(uint16_t line, const char *args)
 
     char *expr = trim_left(cursor);
     trim_right(expr);
-    if (!expression_valid(expr)) return error_result(line, "VAR requires a valid expression");
+    if (!expression_valid(expr) && !string_assignment_valid(expr)) {
+        return error_result(line, "VAR requires a valid expression or string");
+    }
     return ok_result();
 }
 
@@ -407,6 +459,10 @@ static usb_hid_parse_result_t validate_args(uint16_t line, const char *command,
         if (strcmp(command, "JITTER") == 0 &&
             !parse_number_in_range(args, 0, USB_HID_PARSE_MAX_JITTER_PERCENT, NULL)) {
             return error_result(line, "JITTER must be between 0 and 100");
+        }
+        if ((strcmp(command, "DEFAULT_DELAY") == 0 || strcmp(command, "DEFAULTDELAY") == 0) &&
+            !parse_number_in_range(args, 0, 10000, NULL)) {
+            return error_result(line, "DEFAULT_DELAY must be between 0 and 10000 ms");
         }
         return ok_result();
     case ARG_ONE_TOKEN:
@@ -533,6 +589,14 @@ usb_hid_parse_result_t usb_hid_macro_validate(const char *script)
 
         char *line = trim_left(line_buf);
         trim_right(line);
+        if (line[0] == '/' && line[1] == '/') {
+            /* `//` is an exact alias for REM: skip the rest of the line. */
+            cursor += len;
+            if (*cursor == '\r') cursor++;
+            if (*cursor == '\n') cursor++;
+            line_no++;
+            continue;
+        }
         if (line[0] != '\0') {
             char command[32];
             size_t i = 0;
@@ -545,6 +609,7 @@ usb_hid_parse_result_t usb_hid_macro_validate(const char *script)
             }
             command[i] = '\0';
             uppercase(command);
+            normalize_command_alias(command);
 
             char *args = trim_left(line + i);
             trim_right(args);
@@ -552,6 +617,8 @@ usb_hid_parse_result_t usb_hid_macro_validate(const char *script)
             const usb_hid_command_spec_t *spec = find_command(command);
             usb_hid_command_spec_t function_key_spec = {command, ARG_NONE};
             if (!spec && is_function_key(command)) {
+                spec = &function_key_spec;
+            } else if (!spec && is_function_call_command(command)) {
                 spec = &function_key_spec;
             }
             if (!spec) {

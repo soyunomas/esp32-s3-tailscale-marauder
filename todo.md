@@ -142,7 +142,12 @@
   - [x] Parser only accepts local absolute paths.
   - [x] Dry-run execution reports it as skipped and does not open files or network connections.
 - [x] Add dry-run handling for Phase 5 commands that must not affect hardware or networking yet.
-- [ ] Add a dedicated runtime evaluator for variables, expressions, `IF`, and `WHILE` execution.
+- [x] Add a dedicated runtime evaluator for variables, expressions, `IF`, and `WHILE` execution.
+  - [x] Local build passes after adding real HID runtime jumps for `IF`/`ELSE`/`END_IF`, `WHILE`/`END_WHILE`, `BREAK`, and `CONTINUE`.
+  - [x] OTA flash and device-level execution regression after build.
+- [x] Add firmware variable interpolation in `STRING` and `STRINGLN`.
+- [x] Add string variable assignment for `VAR $NAME = value`.
+- [x] Add runtime support for `LOOP`, `FUNCTION`, `END_FUNCTION`, and `RETURN`.
 - [x] Add real USB HID output after TinyUSB/serial safety is confirmed.
 
 ## Phase 6: Example Macros
@@ -176,10 +181,16 @@
   - [x] No changes to captive portal redirect behavior.
   - [x] USB HID status and example validation endpoints work.
   - [x] Real HID mode reports `dry_run:false` after OTA.
-  - [x] Runtime-only commands are blocked by executor preflight before HID output.
+  - [x] Runtime-only commands are blocked by executor preflight before HID output when they still lack real runtime support.
+  - [x] Runtime control-flow commands execute on-device after OTA.
+  - [x] Interpolation, string variables, LOOP, and FUNCTION execute on-device after OTA.
 
 ## Open Design Questions
 
 - Decide whether macros should survive factory reset or be erased with normal NVS settings.
 - Decide whether execution requires a second confirmation for saved macros such as shutdown/restart.
 - Decide whether remote execution should require the user to be authenticated only, or authenticated plus an additional local safety flag.
+
+## Maintenance Checkpoints
+
+- [x] 2026-05-19: Synced `firmware/wifi_repeater.bin` from `build/wifi_repeater.bin` after SHA-256 mismatch; all four firmware artifacts now match their build outputs.

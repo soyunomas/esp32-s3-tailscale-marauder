@@ -4,16 +4,33 @@
 #include <strings.h>
 #include "usb_hid_executor.h"
 #include "usb_hid_device.h"
+#include "usb_hid_evaluator.h"
 #include "usb_hid_macro_parser.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+typedef struct {
+    uint32_t default_delay_ms; /* added to every per-command wait */
+    uint8_t  jitter_percent;   /* 0..100 random variation applied to delays */
+    usb_hid_eval_ctx_t eval;   /* user vars, defines, expression state */
+} usb_hid_exec_ctx_t;
+
+static uint32_t apply_jitter(uint32_t base_ms, uint8_t jitter_percent)
+{
+    if (jitter_percent == 0 || base_ms == 0) return base_ms;
+    uint32_t max_var = (base_ms * jitter_percent) / 100U;
+    if (max_var == 0) return base_ms;
+    uint32_t variation = esp_random() % (max_var + 1U);
+    return base_ms + variation;
+}
+
 #define USB_HID_EXEC_QUEUE_LEN 1
-#define USB_HID_EXEC_TASK_STACK 4096
+#define USB_HID_EXEC_TASK_STACK 8192   /* enlarged for eval ctx (~2 KB) */
 #define USB_HID_EXEC_MAX_RUNTIME_MS 60000
 #define USB_HID_EXEC_MAX_DELAY_MS 10000
 #define USB_HID_EXEC_DEFAULT_STEP_MS 5
@@ -27,6 +44,13 @@ typedef struct {
     usb_hid_macro_t macro;
 } usb_hid_exec_request_t;
 
+typedef struct {
+    uint16_t offset;
+    uint16_t len;
+} usb_hid_line_ref_t;
+
+#define USB_HID_EXEC_CALL_DEPTH 4
+
 static QueueHandle_t s_queue;
 static SemaphoreHandle_t s_lock;
 static volatile bool s_stop_requested;
@@ -37,6 +61,32 @@ static usb_hid_exec_status_t s_status = {
     .dry_run = true,
     .message = "Idle",
 };
+
+bool usb_hid_executor_resolve_internal_var(const char *name, int *value_out)
+{
+    if (!name || !value_out) return false;
+    if (strcmp(name, "$_CAPSLOCK_ON") == 0) {
+        *value_out = usb_hid_device_get_led_state(USB_HID_LED_CAPSLOCK) ? 1 : 0;
+        return true;
+    }
+    if (strcmp(name, "$_NUMLOCK_ON") == 0) {
+        *value_out = usb_hid_device_get_led_state(USB_HID_LED_NUMLOCK) ? 1 : 0;
+        return true;
+    }
+    if (strcmp(name, "$_SCROLLLOCK_ON") == 0) {
+        *value_out = usb_hid_device_get_led_state(USB_HID_LED_SCROLLLOCK) ? 1 : 0;
+        return true;
+    }
+    if (strcmp(name, "$_BUTTON_ENABLED") == 0) {
+        *value_out = 0; /* button hardware not wired yet -- placeholder */
+        return true;
+    }
+    if (strcmp(name, "$_HOST_CONFIGURATION_REQUEST_COUNT") == 0) {
+        *value_out = 0; /* TODO Phase 3: track via tud_mount_cb counter */
+        return true;
+    }
+    return false;
+}
 
 const char *usb_hid_exec_state_name(usb_hid_exec_state_t state)
 {
@@ -115,11 +165,56 @@ static uint32_t delay_from_line(char *line)
     return (uint32_t)value;
 }
 
+/* Evaluator-aware version: accepts DELAY <expression> ($X * 100, RANDOM_INT(10,50), ...).
+ * Falls back to the simple parser if evaluation fails (defensive). */
+static uint32_t compute_command_delay_ms(char *line, usb_hid_eval_ctx_t *eval)
+{
+    char *trimmed = trim_left(line);
+    trim_right(trimmed);
+    if (strncasecmp(trimmed, "DELAY", 5) != 0) return 1;
+    char *arg = trim_left(trimmed + 5);
+    if (*arg == '\0') return 1;
+    int value = 0;
+    if (!usb_hid_eval_expression(eval, arg, &value)) {
+        long lv = strtol(arg, NULL, 10);
+        value = (int)lv;
+    }
+    if (value < 0) value = 1;
+    if (value > USB_HID_EXEC_MAX_DELAY_MS) value = USB_HID_EXEC_MAX_DELAY_MS;
+    return (uint32_t)value;
+}
+
+static void normalize_command_alias_exec(char *command, size_t command_size)
+{
+    static const struct { const char *alias; const char *canonical; } aliases[] = {
+        {"UP", "UPARROW"},
+        {"DOWN", "DOWNARROW"},
+        {"LEFT", "LEFTARROW"},
+        {"RIGHT", "RIGHTARROW"},
+        {"ESC", "ESCAPE"},
+        {"CONTROL", "CTRL"},
+        {"OPTION", "ALT"},
+    };
+    for (size_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); i++) {
+        if (strcmp(command, aliases[i].alias) == 0) {
+            strlcpy(command, aliases[i].canonical, command_size);
+            return;
+        }
+    }
+}
+
 static bool command_from_line(char *line, char *command, size_t command_size, char **args)
 {
     char *trimmed = trim_left(line);
     trim_right(trimmed);
     if (trimmed[0] == '\0') return false;
+    /* `//` is an exact alias of REM: treat the whole line as a comment. */
+    if (trimmed[0] == '/' && trimmed[1] == '/') {
+        strlcpy(command, "REM", command_size);
+        *args = trimmed + 2;
+        trim_right(*args);
+        return true;
+    }
 
     size_t i = 0;
     while (trimmed[i] && !isspace((unsigned char)trimmed[i]) && i < command_size - 1) {
@@ -129,7 +224,187 @@ static bool command_from_line(char *line, char *command, size_t command_size, ch
     command[i] = '\0';
     *args = trim_left(trimmed + i);
     trim_right(*args);
+    normalize_command_alias_exec(command, command_size);
     return command[0] != '\0';
+}
+
+static void strip_trailing_then_exec(char *value)
+{
+    size_t len = strlen(value);
+    while (len > 0 && isspace((unsigned char)value[len - 1])) len--;
+    if (len < 4) return;
+
+    const char *tail = value + len - 4;
+    if (strncasecmp(tail, "THEN", 4) == 0 &&
+        (len == 4 || isspace((unsigned char)value[len - 5]) || value[len - 5] == ')')) {
+        value[len - 4] = '\0';
+        trim_right(value);
+    }
+}
+
+static size_t build_line_refs(const char *script, usb_hid_line_ref_t *lines, size_t max_lines)
+{
+    size_t count = 0;
+    size_t pos = 0;
+    while (script[pos] != '\0' && count < max_lines) {
+        size_t start = pos;
+        while (script[pos] != '\0' && script[pos] != '\n' && script[pos] != '\r') pos++;
+        lines[count].offset = (uint16_t)start;
+        lines[count].len = (uint16_t)(pos - start);
+        count++;
+        if (script[pos] == '\r') pos++;
+        if (script[pos] == '\n') pos++;
+    }
+    return count;
+}
+
+static bool line_command_at(const char *script, const usb_hid_line_ref_t *lines,
+                            size_t line_index, char *command, size_t command_size)
+{
+    char line_buf[192];
+    if (lines[line_index].len >= sizeof(line_buf)) return false;
+    memcpy(line_buf, script + lines[line_index].offset, lines[line_index].len);
+    line_buf[lines[line_index].len] = '\0';
+
+    char *args = NULL;
+    return command_from_line(line_buf, command, command_size, &args);
+}
+
+static bool find_if_peer_forward(const char *script, const usb_hid_line_ref_t *lines,
+                                 size_t line_count, size_t if_index,
+                                 bool want_else, size_t *target_out)
+{
+    int depth = 0;
+    for (size_t i = if_index + 1; i < line_count; i++) {
+        char command[32] = {0};
+        if (!line_command_at(script, lines, i, command, sizeof(command))) continue;
+
+        if (strcmp(command, "IF") == 0) {
+            depth++;
+        } else if (strcmp(command, "END_IF") == 0) {
+            if (depth == 0) {
+                *target_out = i;
+                return true;
+            }
+            depth--;
+        } else if (want_else && strcmp(command, "ELSE") == 0 && depth == 0) {
+            *target_out = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool find_matching_while_backward(const char *script, const usb_hid_line_ref_t *lines,
+                                         size_t from_index, size_t *target_out)
+{
+    int depth = 0;
+    for (size_t i = from_index; i > 0; i--) {
+        size_t idx = i - 1;
+        char command[32] = {0};
+        if (!line_command_at(script, lines, idx, command, sizeof(command))) continue;
+
+        if (strcmp(command, "END_WHILE") == 0) {
+            depth++;
+        } else if (strcmp(command, "WHILE") == 0) {
+            if (depth == 0) {
+                *target_out = idx;
+                return true;
+            }
+            depth--;
+        }
+    }
+    return false;
+}
+
+static bool find_matching_end_while_forward(const char *script, const usb_hid_line_ref_t *lines,
+                                            size_t line_count, size_t from_index,
+                                            size_t *target_out)
+{
+    int depth = 0;
+    for (size_t i = from_index + 1; i < line_count; i++) {
+        char command[32] = {0};
+        if (!line_command_at(script, lines, i, command, sizeof(command))) continue;
+
+        if (strcmp(command, "WHILE") == 0) {
+            depth++;
+        } else if (strcmp(command, "END_WHILE") == 0) {
+            if (depth == 0) {
+                *target_out = i;
+                return true;
+            }
+            depth--;
+        }
+    }
+    return false;
+}
+
+static bool find_end_function_forward(const char *script, const usb_hid_line_ref_t *lines,
+                                      size_t line_count, size_t from_index,
+                                      size_t *target_out)
+{
+    int depth = 0;
+    for (size_t i = from_index + 1; i < line_count; i++) {
+        char command[32] = {0};
+        if (!line_command_at(script, lines, i, command, sizeof(command))) continue;
+
+        if (strcmp(command, "FUNCTION") == 0) {
+            depth++;
+        } else if (strcmp(command, "END_FUNCTION") == 0) {
+            if (depth == 0) {
+                *target_out = i;
+                return true;
+            }
+            depth--;
+        }
+    }
+    return false;
+}
+
+static bool command_is_function_call(const char *command, char *name_out, size_t name_size)
+{
+    size_t len = command ? strlen(command) : 0;
+    if (len < 3 || command[len - 2] != '(' || command[len - 1] != ')') return false;
+    if (len - 2 >= name_size) return false;
+    memcpy(name_out, command, len - 2);
+    name_out[len - 2] = '\0';
+    if (!isalpha((unsigned char)name_out[0]) && name_out[0] != '_') return false;
+    for (size_t i = 1; name_out[i] != '\0'; i++) {
+        if (!isalnum((unsigned char)name_out[i]) && name_out[i] != '_') return false;
+    }
+    return true;
+}
+
+static bool function_def_matches(const char *args, const char *name)
+{
+    char buf[64];
+    strlcpy(buf, args, sizeof(buf));
+    char *value = trim_left(buf);
+    trim_right(value);
+    size_t len = strlen(value);
+    if (len < 3 || value[len - 2] != '(' || value[len - 1] != ')') return false;
+    value[len - 2] = '\0';
+    return strcasecmp(value, name) == 0;
+}
+
+static bool find_function_forward(const char *script, const usb_hid_line_ref_t *lines,
+                                  size_t line_count, const char *name,
+                                  size_t *target_out)
+{
+    for (size_t i = 0; i < line_count; i++) {
+        char line_buf[192];
+        if (lines[i].len >= sizeof(line_buf)) continue;
+        memcpy(line_buf, script + lines[i].offset, lines[i].len);
+        line_buf[lines[i].len] = '\0';
+        char command[32] = {0};
+        char *args = NULL;
+        if (!command_from_line(line_buf, command, sizeof(command), &args)) continue;
+        if (strcmp(command, "FUNCTION") == 0 && function_def_matches(args, name)) {
+            *target_out = i;
+            return true;
+        }
+    }
+    return false;
 }
 
 static uint32_t dry_run_wait_for_command(const char *command, char *line)
@@ -177,6 +452,8 @@ static bool dry_run_command_finishes_macro(const char *command, char *message, s
 #define HID_KEY_PERIOD        0x37
 #define HID_KEY_SLASH         0x38
 #define HID_KEY_F1            0x3a
+#define HID_KEY_PRINT_SCREEN  0x46
+#define HID_KEY_PAUSE         0x48
 #define HID_KEY_INSERT        0x49
 #define HID_KEY_HOME          0x4a
 #define HID_KEY_PAGE_UP       0x4b
@@ -188,6 +465,7 @@ static bool dry_run_command_finishes_macro(const char *command, char *message, s
 #define HID_KEY_ARROW_DOWN    0x51
 #define HID_KEY_ARROW_UP      0x52
 #define HID_KEY_NON_US_BACKSLASH 0x64
+#define HID_KEY_MENU          0x65
 
 typedef struct {
     uint8_t modifier;
@@ -276,11 +554,13 @@ static bool layout_uses_spanish_punctuation(usb_hid_layout_t layout)
 
 static bool modifier_from_token(const char *token, uint8_t *modifier)
 {
-    if (strcasecmp(token, "CTRL") == 0) {
+    if (strcasecmp(token, "CTRL") == 0 ||
+        strcasecmp(token, "CONTROL") == 0) {
         *modifier = USB_HID_MOD_CTRL;
     } else if (strcasecmp(token, "SHIFT") == 0) {
         *modifier = USB_HID_MOD_SHIFT;
-    } else if (strcasecmp(token, "ALT") == 0) {
+    } else if (strcasecmp(token, "ALT") == 0 ||
+               strcasecmp(token, "OPTION") == 0) {
         *modifier = USB_HID_MOD_ALT;
     } else if (strcasecmp(token, "GUI") == 0 ||
                strcasecmp(token, "WINDOWS") == 0 ||
@@ -465,10 +745,17 @@ static bool key_from_token(const char *token, const char *layout, usb_hid_key_t 
     else if (strcasecmp(token, "END") == 0) key->keycode = HID_KEY_END;
     else if (strcasecmp(token, "PAGEUP") == 0) key->keycode = HID_KEY_PAGE_UP;
     else if (strcasecmp(token, "PAGEDOWN") == 0) key->keycode = HID_KEY_PAGE_DOWN;
-    else if (strcasecmp(token, "UPARROW") == 0) key->keycode = HID_KEY_ARROW_UP;
-    else if (strcasecmp(token, "DOWNARROW") == 0) key->keycode = HID_KEY_ARROW_DOWN;
-    else if (strcasecmp(token, "LEFTARROW") == 0) key->keycode = HID_KEY_ARROW_LEFT;
-    else if (strcasecmp(token, "RIGHTARROW") == 0) key->keycode = HID_KEY_ARROW_RIGHT;
+    else if (strcasecmp(token, "UPARROW") == 0 ||
+             strcasecmp(token, "UP") == 0) key->keycode = HID_KEY_ARROW_UP;
+    else if (strcasecmp(token, "DOWNARROW") == 0 ||
+             strcasecmp(token, "DOWN") == 0) key->keycode = HID_KEY_ARROW_DOWN;
+    else if (strcasecmp(token, "LEFTARROW") == 0 ||
+             strcasecmp(token, "LEFT") == 0) key->keycode = HID_KEY_ARROW_LEFT;
+    else if (strcasecmp(token, "RIGHTARROW") == 0 ||
+             strcasecmp(token, "RIGHT") == 0) key->keycode = HID_KEY_ARROW_RIGHT;
+    else if (strcasecmp(token, "PRINTSCREEN") == 0) key->keycode = HID_KEY_PRINT_SCREEN;
+    else if (strcasecmp(token, "PAUSE") == 0) key->keycode = HID_KEY_PAUSE;
+    else if (strcasecmp(token, "MENU") == 0) key->keycode = HID_KEY_MENU;
     else if ((token[0] == 'F' || token[0] == 'f') && token[1] != '\0') {
         char *end = NULL;
         long f = strtol(token + 1, &end, 10);
@@ -482,17 +769,23 @@ static bool command_supported_for_real(const char *command)
 {
     static const char *const supported[] = {
         "REM", "END_REM", "STRING", "STRINGLN", "DELAY",
+        "DEFAULT_DELAY", "DEFAULTDELAY", "JITTER",
+        "VAR", "DEFINE",
+        "IF", "ELSE", "END_IF", "WHILE", "END_WHILE", "BREAK", "CONTINUE",
         "ENTER", "TAB", "ESCAPE", "SPACE", "BACKSPACE", "DELETE", "INSERT",
         "HOME", "END", "PAGEUP", "PAGEDOWN",
+        "PRINTSCREEN", "PAUSE", "MENU",
         "UPARROW", "DOWNARROW", "LEFTARROW", "RIGHTARROW",
         "CTRL", "ALT", "SHIFT", "GUI", "WINDOWS", "COMMAND",
         "HOLD", "RELEASE", "STOP_PAYLOAD",
+        "LOOP", "FUNCTION", "END_FUNCTION", "RETURN",
         "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
     };
     for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
         if (strcmp(command, supported[i]) == 0) return true;
     }
-    return false;
+    char fn_name[32];
+    return command_is_function_call(command, fn_name, sizeof(fn_name));
 }
 
 static bool modifier_combo_supported(const char *command, const char *args, const char *layout)
@@ -520,9 +813,30 @@ static bool modifier_combo_supported(const char *command, const char *args, cons
 
 static bool command_args_supported_for_real(const char *command, const char *args, const char *layout)
 {
+    char fn_name[32];
+    if (command_is_function_call(command, fn_name, sizeof(fn_name))) {
+        return args == NULL || args[0] == '\0';
+    }
+
     if (strcmp(command, "REM") == 0 ||
         strcmp(command, "END_REM") == 0 ||
         strcmp(command, "DELAY") == 0 ||
+        strcmp(command, "VAR") == 0 ||
+        strcmp(command, "DEFINE") == 0 ||
+        strcmp(command, "IF") == 0 ||
+        strcmp(command, "ELSE") == 0 ||
+        strcmp(command, "END_IF") == 0 ||
+        strcmp(command, "WHILE") == 0 ||
+        strcmp(command, "END_WHILE") == 0 ||
+        strcmp(command, "BREAK") == 0 ||
+        strcmp(command, "CONTINUE") == 0 ||
+        strcmp(command, "LOOP") == 0 ||
+        strcmp(command, "FUNCTION") == 0 ||
+        strcmp(command, "END_FUNCTION") == 0 ||
+        strcmp(command, "RETURN") == 0 ||
+        strcmp(command, "DEFAULT_DELAY") == 0 ||
+        strcmp(command, "DEFAULTDELAY") == 0 ||
+        strcmp(command, "JITTER") == 0 ||
         strcmp(command, "STOP_PAYLOAD") == 0) {
         return true;
     }
@@ -563,7 +877,10 @@ static void dry_run_status_for_command(const char *command, const char *args,
                strcmp(command, "RESTORE_ATTACKMODE") == 0) {
         strlcpy(message, "USB mode command skipped in dry run", message_size);
     } else if (strcmp(command, "JITTER") == 0 ||
-               strcmp(command, "DEFINE") == 0 ||
+               strcmp(command, "DEFAULT_DELAY") == 0 ||
+               strcmp(command, "DEFAULTDELAY") == 0) {
+        snprintf(message, message_size, "%s applied (dry run)", command);
+    } else if (strcmp(command, "DEFINE") == 0 ||
                strcmp(command, "VAR") == 0 ||
                strcmp(command, "IF") == 0 ||
                strcmp(command, "ELSE") == 0 ||
@@ -656,6 +973,71 @@ static esp_err_t send_text(uint8_t held_mods, const char *text, const char *layo
     return ESP_OK;
 }
 
+static void unquote_string_value(char *value)
+{
+    trim_right(value);
+    size_t len = strlen(value);
+    if (len >= 2 && (value[0] == '"' || value[0] == '\'') && value[len - 1] == value[0]) {
+        memmove(value, value + 1, len - 2);
+        value[len - 2] = '\0';
+    }
+}
+
+static bool append_text(char *out, size_t out_size, size_t *pos, const char *text)
+{
+    for (size_t i = 0; text[i] != '\0'; i++) {
+        if (*pos + 1 >= out_size) return false;
+        out[(*pos)++] = text[i];
+    }
+    out[*pos] = '\0';
+    return true;
+}
+
+static bool expand_runtime_text(const char *src, usb_hid_exec_ctx_t *ctx,
+                                char *out, size_t out_size)
+{
+    size_t pos = 0;
+    out[0] = '\0';
+    for (size_t i = 0; src[i] != '\0'; i++) {
+        if ((src[i] == '$' || src[i] == '#') && src[i + 1] == src[i]) {
+            if (pos + 1 >= out_size) return false;
+            out[pos++] = src[i++];
+            out[pos] = '\0';
+            continue;
+        }
+        if ((src[i] == '$' || src[i] == '#') &&
+            (isalpha((unsigned char)src[i + 1]) || src[i + 1] == '_')) {
+            char name[USB_HID_EVAL_MAX_NAME];
+            size_t n = 0;
+            name[n++] = src[i++];
+            while ((isalnum((unsigned char)src[i]) || src[i] == '_') && n + 1 < sizeof(name)) {
+                name[n++] = src[i++];
+            }
+            name[n] = '\0';
+            i--;
+
+            char value[USB_HID_EVAL_MAX_STRING_VALUE];
+            if (name[0] == '$') {
+                int internal = 0;
+                if (usb_hid_executor_resolve_internal_var(name, &internal)) {
+                    snprintf(value, sizeof(value), "%d", internal);
+                } else if (!usb_hid_eval_get_var_text(&ctx->eval, name, value, sizeof(value))) {
+                    value[0] = '\0';
+                }
+            } else {
+                const char *define_value = usb_hid_eval_get_define(&ctx->eval, name);
+                strlcpy(value, define_value ? define_value : "", sizeof(value));
+            }
+            if (!append_text(out, out_size, &pos, value)) return false;
+            continue;
+        }
+        if (pos + 1 >= out_size) return false;
+        out[pos++] = src[i];
+        out[pos] = '\0';
+    }
+    return true;
+}
+
 static esp_err_t send_modifier_combo(uint8_t held_mods, const char *command, const char *args, const char *layout)
 {
     uint8_t mods = held_mods;
@@ -686,6 +1068,7 @@ static esp_err_t send_modifier_combo(uint8_t held_mods, const char *command, con
 static esp_err_t execute_real_command(const char *command, const char *args,
                                       const char *layout,
                                       uint8_t *held_mods, bool *finish,
+                                      usb_hid_exec_ctx_t *ctx,
                                       char *message, size_t message_size)
 {
     *finish = false;
@@ -694,7 +1077,78 @@ static esp_err_t execute_real_command(const char *command, const char *args,
         return ESP_OK;
     }
     if (strcmp(command, "DELAY") == 0) {
+        /* Body of DELAY is evaluated in the wait loop via compute_command_delay_ms;
+         * here we just acknowledge so the status message is meaningful. */
         strlcpy(message, "Delay", message_size);
+        return ESP_OK;
+    }
+    if (strcmp(command, "VAR") == 0) {
+        /* "VAR $NAME = expr" -- parse name, expect '=' and evaluate the RHS. */
+        char buf[160];
+        strlcpy(buf, args, sizeof(buf));
+        char *name = buf;
+        while (*name && isspace((unsigned char)*name)) name++;
+        char *p = name;
+        while (*p && !isspace((unsigned char)*p) && *p != '=') p++;
+        char sep = *p;
+        if (*p) *p++ = '\0';
+        if (sep != '=') {
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (*p != '=') { strlcpy(message, "VAR missing '='", message_size); return ESP_ERR_INVALID_ARG; }
+            p++;
+        }
+        while (*p && isspace((unsigned char)*p)) p++;
+        int value = 0;
+        if (!usb_hid_eval_expression(&ctx->eval, p, &value)) {
+            char string_value[USB_HID_EVAL_MAX_STRING_VALUE];
+            strlcpy(string_value, p, sizeof(string_value));
+            unquote_string_value(string_value);
+            if (!usb_hid_eval_set_string_var(&ctx->eval, name, string_value)) {
+                strlcpy(message, "VAR string table full or too long", message_size);
+                return ESP_ERR_NO_MEM;
+            }
+            snprintf(message, message_size, "%.40s = %.40s", name, string_value);
+            return ESP_OK;
+        }
+        if (!usb_hid_eval_set_var(&ctx->eval, name, value)) {
+            strlcpy(message, "VAR table full or bad name", message_size);
+            return ESP_ERR_NO_MEM;
+        }
+        snprintf(message, message_size, "%.40s = %d", name, value);
+        return ESP_OK;
+    }
+    if (strcmp(command, "DEFINE") == 0) {
+        /* "DEFINE #NAME value..." -- value is stored verbatim, evaluated lazily. */
+        char buf[160];
+        strlcpy(buf, args, sizeof(buf));
+        char *name = buf;
+        while (*name && isspace((unsigned char)*name)) name++;
+        char *p = name;
+        while (*p && !isspace((unsigned char)*p)) p++;
+        if (*p) *p++ = '\0';
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '\0') { strlcpy(message, "DEFINE missing value", message_size); return ESP_ERR_INVALID_ARG; }
+        if (!usb_hid_eval_add_define(&ctx->eval, name, p)) {
+            strlcpy(message, "DEFINE table full or too long", message_size);
+            return ESP_ERR_NO_MEM;
+        }
+        snprintf(message, message_size, "%.40s defined", name);
+        return ESP_OK;
+    }
+    if (strcmp(command, "DEFAULT_DELAY") == 0 || strcmp(command, "DEFAULTDELAY") == 0) {
+        long value = (args && args[0]) ? strtol(args, NULL, 10) : 0;
+        if (value < 0) value = 0;
+        if (value > USB_HID_EXEC_MAX_DELAY_MS) value = USB_HID_EXEC_MAX_DELAY_MS;
+        ctx->default_delay_ms = (uint32_t)value;
+        snprintf(message, message_size, "Default delay set to %lu ms", (unsigned long)ctx->default_delay_ms);
+        return ESP_OK;
+    }
+    if (strcmp(command, "JITTER") == 0) {
+        long value = (args && args[0]) ? strtol(args, NULL, 10) : 0;
+        if (value < 0) value = 0;
+        if (value > 100) value = 100;
+        ctx->jitter_percent = (uint8_t)value;
+        snprintf(message, message_size, "Jitter set to %u%%", (unsigned)ctx->jitter_percent);
         return ESP_OK;
     }
     if (strcmp(command, "STOP_PAYLOAD") == 0) {
@@ -704,7 +1158,12 @@ static esp_err_t execute_real_command(const char *command, const char *args,
     }
 
     if (strcmp(command, "STRING") == 0 || strcmp(command, "STRINGLN") == 0) {
-        esp_err_t ret = send_text(*held_mods, args, layout);
+        char expanded[256];
+        if (!expand_runtime_text(args, ctx, expanded, sizeof(expanded))) {
+            strlcpy(message, "Text expansion failed", message_size);
+            return ESP_ERR_NO_MEM;
+        }
+        esp_err_t ret = send_text(*held_mods, expanded, layout);
         if (ret == ESP_OK && strcmp(command, "STRINGLN") == 0) {
             usb_hid_key_t enter = {.keycode = HID_KEY_ENTER};
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -849,16 +1308,37 @@ static void run_macro_real(const usb_hid_macro_t *macro)
         return;
     }
 
+    size_t max_lines = total ? total : 1;
+    usb_hid_line_ref_t *lines = calloc(max_lines, sizeof(*lines));
+    if (!lines) {
+        set_status(USB_HID_EXEC_ERROR, macro, 0, total, "Line index allocation failed");
+        return;
+    }
+    size_t line_count = build_line_refs(macro->script, lines, max_lines);
+    total = (uint16_t)line_count;
+    uint16_t *loop_counts = calloc(max_lines, sizeof(*loop_counts));
+    if (!loop_counts) {
+        free(lines);
+        set_status(USB_HID_EXEC_ERROR, macro, 0, total, "Loop counter allocation failed");
+        return;
+    }
+
     uint32_t started = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    const char *cursor = macro->script;
-    uint16_t line_no = 1;
+    size_t pc = 0;
+    size_t call_stack[USB_HID_EXEC_CALL_DEPTH];
+    size_t call_depth = 0;
     uint8_t held_mods = 0;
+    usb_hid_exec_ctx_t ctx = { .default_delay_ms = 0, .jitter_percent = 0 };
+    usb_hid_eval_init(&ctx.eval);
     char line_buf[192];
 
-    while (*cursor) {
+    while (pc < line_count) {
+        uint16_t line_no = (uint16_t)(pc + 1);
         if (s_stop_requested) {
             usb_hid_device_release();
             set_status(USB_HID_EXEC_DONE, macro, line_no, total, "Stopped");
+            free(loop_counts);
+            free(lines);
             return;
         }
 
@@ -866,19 +1346,21 @@ static void run_macro_real(const usb_hid_macro_t *macro)
         if (now - started > USB_HID_EXEC_MAX_RUNTIME_MS) {
             usb_hid_device_release();
             set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "Runtime limit reached");
+            free(loop_counts);
+            free(lines);
             return;
         }
 
-        size_t len = 0;
-        while (cursor[len] && cursor[len] != '\n' && cursor[len] != '\r') len++;
-        if (len >= sizeof(line_buf)) {
+        if (lines[pc].len >= sizeof(line_buf)) {
             usb_hid_device_release();
             set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "Line is too long");
+            free(loop_counts);
+            free(lines);
             return;
         }
 
-        memcpy(line_buf, cursor, len);
-        line_buf[len] = '\0';
+        memcpy(line_buf, macro->script + lines[pc].offset, lines[pc].len);
+        line_buf[lines[pc].len] = '\0';
 
         char command[32] = {0};
         char *args = NULL;
@@ -886,12 +1368,190 @@ static void run_macro_real(const usb_hid_macro_t *macro)
         bool finish = false;
         esp_err_t ret = ESP_OK;
         if (command_from_line(line_buf, command, sizeof(command), &args)) {
-            ret = execute_real_command(command, args, layout, &held_mods, &finish, message, sizeof(message));
+            if (strcmp(command, "IF") == 0) {
+                char expr[192];
+                strlcpy(expr, args, sizeof(expr));
+                strip_trailing_then_exec(expr);
+                int value = 0;
+                if (!usb_hid_eval_expression(&ctx.eval, expr, &value)) {
+                    usb_hid_device_release();
+                    set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "IF expression failed");
+                    free(loop_counts);
+                    free(lines);
+                    return;
+                }
+                if (value) {
+                    set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "IF true");
+                    pc++;
+                } else {
+                    size_t target = pc;
+                    if (!find_if_peer_forward(macro->script, lines, line_count, pc, true, &target)) {
+                        usb_hid_device_release();
+                        set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "IF target not found");
+                        free(loop_counts);
+                        free(lines);
+                        return;
+                    }
+                    set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "IF false");
+                    pc = target + 1;
+                }
+                continue;
+            }
+            if (strcmp(command, "ELSE") == 0) {
+                size_t target = pc;
+                if (!find_if_peer_forward(macro->script, lines, line_count, pc, false, &target)) {
+                    usb_hid_device_release();
+                    set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "ELSE target not found");
+                    free(loop_counts);
+                    free(lines);
+                    return;
+                }
+                set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "ELSE skipped");
+                pc = target + 1;
+                continue;
+            }
+            if (strcmp(command, "END_IF") == 0) {
+                set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "END_IF");
+                pc++;
+                continue;
+            }
+            if (strcmp(command, "WHILE") == 0) {
+                int value = 0;
+                if (!usb_hid_eval_expression(&ctx.eval, args, &value)) {
+                    usb_hid_device_release();
+                    set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "WHILE expression failed");
+                    free(loop_counts);
+                    free(lines);
+                    return;
+                }
+                if (value) {
+                    set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "WHILE true");
+                    pc++;
+                } else {
+                    size_t target = pc;
+                    if (!find_matching_end_while_forward(macro->script, lines, line_count, pc, &target)) {
+                        usb_hid_device_release();
+                        set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "WHILE target not found");
+                        free(loop_counts);
+                        free(lines);
+                        return;
+                    }
+                    set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "WHILE false");
+                    pc = target + 1;
+                }
+                continue;
+            }
+            if (strcmp(command, "END_WHILE") == 0) {
+                size_t target = pc;
+                if (!find_matching_while_backward(macro->script, lines, pc, &target)) {
+                    usb_hid_device_release();
+                    set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "END_WHILE target not found");
+                    free(loop_counts);
+                    free(lines);
+                    return;
+                }
+                set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "WHILE repeat");
+                pc = target;
+                continue;
+            }
+            if (strcmp(command, "BREAK") == 0) {
+                size_t target = pc;
+                if (!find_matching_end_while_forward(macro->script, lines, line_count, pc, &target)) {
+                    usb_hid_device_release();
+                    set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "BREAK target not found");
+                    free(loop_counts);
+                    free(lines);
+                    return;
+                }
+                set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "BREAK");
+                pc = target + 1;
+                continue;
+            }
+            if (strcmp(command, "CONTINUE") == 0) {
+                size_t target = pc;
+                if (!find_matching_while_backward(macro->script, lines, pc, &target)) {
+                    usb_hid_device_release();
+                    set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "CONTINUE target not found");
+                    free(loop_counts);
+                    free(lines);
+                    return;
+                }
+                set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "CONTINUE");
+                pc = target;
+                continue;
+            }
+            if (strcmp(command, "LOOP") == 0) {
+                if (args && args[0] != '\0') {
+                    long count = strtol(args, NULL, 10);
+                    if (count <= 0) {
+                        pc++;
+                    } else if (loop_counts[pc] < (uint16_t)count) {
+                        loop_counts[pc]++;
+                        set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "LOOP repeat");
+                        pc = 0;
+                    } else {
+                        loop_counts[pc] = 0;
+                        set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "LOOP done");
+                        pc++;
+                    }
+                } else {
+                    set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "LOOP repeat");
+                    pc = 0;
+                }
+                continue;
+            }
+            if (strcmp(command, "FUNCTION") == 0) {
+                size_t target = pc;
+                if (!find_end_function_forward(macro->script, lines, line_count, pc, &target)) {
+                    usb_hid_device_release();
+                    set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "FUNCTION target not found");
+                    free(loop_counts);
+                    free(lines);
+                    return;
+                }
+                set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "FUNCTION skipped");
+                pc = target + 1;
+                continue;
+            }
+            if (strcmp(command, "END_FUNCTION") == 0 || strcmp(command, "RETURN") == 0) {
+                if (call_depth == 0) {
+                    pc++;
+                } else {
+                    pc = call_stack[--call_depth];
+                }
+                set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "FUNCTION return");
+                continue;
+            }
+            char fn_name[32];
+            if (command_is_function_call(command, fn_name, sizeof(fn_name))) {
+                size_t target = 0;
+                if (!find_function_forward(macro->script, lines, line_count, fn_name, &target)) {
+                    usb_hid_device_release();
+                    set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "FUNCTION not found");
+                    free(loop_counts);
+                    free(lines);
+                    return;
+                }
+                if (call_depth >= USB_HID_EXEC_CALL_DEPTH) {
+                    usb_hid_device_release();
+                    set_status(USB_HID_EXEC_ERROR, macro, line_no, total, "FUNCTION call stack full");
+                    free(loop_counts);
+                    free(lines);
+                    return;
+                }
+                call_stack[call_depth++] = pc + 1;
+                set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "FUNCTION call");
+                pc = target + 1;
+                continue;
+            }
+            ret = execute_real_command(command, args, layout, &held_mods, &finish, &ctx, message, sizeof(message));
         }
         if (ret != ESP_OK) {
             usb_hid_device_release();
             snprintf(message, sizeof(message), "Line %u failed: %s", line_no, esp_err_to_name(ret));
             set_status(USB_HID_EXEC_ERROR, macro, line_no, total, message);
+            free(loop_counts);
+            free(lines);
             return;
         }
 
@@ -899,15 +1559,31 @@ static void run_macro_real(const usb_hid_macro_t *macro)
                    macro, line_no, total, message);
         if (finish) {
             usb_hid_device_release();
+            free(loop_counts);
+            free(lines);
             return;
         }
 
-        uint32_t wait_ms = command[0] ? delay_from_line(line_buf) : USB_HID_EXEC_DEFAULT_STEP_MS;
+        uint32_t base_wait = command[0] ? compute_command_delay_ms(line_buf, &ctx.eval)
+                                        : USB_HID_EXEC_DEFAULT_STEP_MS;
+        /* Meta-commands set runtime state; they shouldn't introduce extra waits. */
+        bool is_control_meta = (strcmp(command, "DEFAULT_DELAY") == 0 ||
+                                strcmp(command, "DEFAULTDELAY") == 0 ||
+                                strcmp(command, "JITTER") == 0 ||
+                                strcmp(command, "VAR") == 0 ||
+                                strcmp(command, "DEFINE") == 0);
+        if (!is_control_meta) {
+            base_wait += ctx.default_delay_ms;
+        }
+        uint32_t wait_ms = apply_jitter(base_wait, ctx.jitter_percent);
+        if (wait_ms > USB_HID_EXEC_MAX_DELAY_MS) wait_ms = USB_HID_EXEC_MAX_DELAY_MS;
         uint32_t waited = 0;
         while (waited < wait_ms) {
             if (s_stop_requested) {
                 usb_hid_device_release();
                 set_status(USB_HID_EXEC_DONE, macro, line_no, total, "Stopped");
+                free(loop_counts);
+                free(lines);
                 return;
             }
             uint32_t slice = (wait_ms - waited) > 50 ? 50 : (wait_ms - waited);
@@ -915,14 +1591,13 @@ static void run_macro_real(const usb_hid_macro_t *macro)
             waited += slice;
         }
 
-        cursor += len;
-        if (*cursor == '\r') cursor++;
-        if (*cursor == '\n') cursor++;
-        line_no++;
+        pc++;
     }
 
     usb_hid_device_release();
     set_status(USB_HID_EXEC_DONE, macro, total, total, "USB HID complete");
+    free(loop_counts);
+    free(lines);
 }
 
 static void executor_task(void *arg)
