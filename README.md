@@ -9,7 +9,7 @@ All configuration is done via an embedded responsive web UI served directly from
 <p align="center">
   <a href="img/screenshot1.png"><img src="img/screenshot1.png" width="19%" alt="Dashboard" /></a>
   <a href="img/screenshot2.png"><img src="img/screenshot2.png" width="19%" alt="WiFi Config" /></a>
-  <a href="img/screenshot3.png"><img src="img/screenshot3.png" width="19%" alt="Tailscale" /></a>
+  <a href="img/screenshot3.png"><img src="img/screenshot3.png" width="19%" alt="Tailscale" /></a><br>
   <a href="img/screenshot4.png"><img src="img/screenshot4.png" width="19%" alt="USB HID" /></a>
   <a href="img/screenshot5.png"><img src="img/screenshot5.png" width="19%" alt="System" /></a>
   <a href="img/screenshot5.png"><img src="img/screenshot5.png" width="19%" alt="Scheduler" /></a>
