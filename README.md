@@ -166,8 +166,8 @@ esptool.py -p /dev/ttyACM0 -b 460800 --before default_reset --after hard_reset -
   write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m \
   0x0 firmware/bootloader.bin \
   0x8000 firmware/partition-table.bin \
-  0xf000 firmware/ota_data_initial.bin \
-  0x20000 firmware/wifi_repeater.bin
+  0x89000 firmware/ota_data_initial.bin \
+  0x90000 firmware/wifi_repeater.bin
 ```
 
 ### Subsequent Updates (Web OTA)
