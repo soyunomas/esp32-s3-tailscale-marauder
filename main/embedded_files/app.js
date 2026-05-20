@@ -55,6 +55,9 @@
     });
   });
 
+  document.getElementById('staStaticEnabled').addEventListener('change',function(){
+    document.getElementById('staStaticFields').style.display=this.checked?'block':'none';
+  });
   document.getElementById('eapEnabled').addEventListener('change',function(){
     document.getElementById('eapFields').style.display=this.checked?'block':'none';
   });
@@ -442,7 +445,13 @@
       sta_mac_custom:document.getElementById('staMacCustom').checked,
       sta_mac:document.getElementById('staMacInput').value.trim(),
       ap_mac_custom:document.getElementById('apMacCustom').checked,
-      ap_mac:document.getElementById('apMacInput').value.trim()
+      ap_mac:document.getElementById('apMacInput').value.trim(),
+      sta_static_ip_enabled:document.getElementById('staStaticEnabled').checked?1:0,
+      sta_static_ip:document.getElementById('staStaticIp').value.trim(),
+      sta_static_netmask:document.getElementById('staStaticNetmask').value.trim(),
+      sta_static_gw:document.getElementById('staStaticGw').value.trim(),
+      sta_static_dns1:document.getElementById('staStaticDns1').value.trim(),
+      sta_static_dns2:document.getElementById('staStaticDns2').value.trim()
     };
     // Add port forwarding rules as flat keys
     var rules=document.querySelectorAll('.pf-rule');
@@ -983,6 +992,16 @@
       document.getElementById('staMacInput').value=cfg.sta_mac||'';
       document.getElementById('apMacCustom').checked=!!cfg.ap_mac_custom;
       document.getElementById('apMacInput').value=cfg.ap_mac||'';
+      // Static IP (STA)
+      var staticCb=document.getElementById('staStaticEnabled');
+      staticCb.checked=!!cfg.sta_static_ip_enabled;
+      document.getElementById('staStaticFields').style.display=staticCb.checked?'block':'none';
+      function _ipShow(v){return (!v||v==='0.0.0.0')?'':v;}
+      document.getElementById('staStaticIp').value=_ipShow(cfg.sta_static_ip);
+      document.getElementById('staStaticNetmask').value=_ipShow(cfg.sta_static_netmask);
+      document.getElementById('staStaticGw').value=_ipShow(cfg.sta_static_gw);
+      document.getElementById('staStaticDns1').value=_ipShow(cfg.sta_static_dns1);
+      document.getElementById('staStaticDns2').value=_ipShow(cfg.sta_static_dns2);
       // EAP
       var eapCb=document.getElementById('eapEnabled');
       eapCb.checked=cfg.sta_eap_enabled||false;

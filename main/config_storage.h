@@ -122,6 +122,13 @@ typedef struct {
     bool usb_hid_keepalive_enabled;
     uint16_t usb_hid_keepalive_interval_s;
     char usb_hid_keepalive_key[CFG_USB_HID_KEEPALIVE_KEY_LEN];
+    // Static IP for STA (when joining an upstream AP). All in network byte order.
+    bool     sta_static_ip_enabled;
+    uint32_t sta_static_ip;
+    uint32_t sta_static_gw;
+    uint32_t sta_static_netmask;
+    uint32_t sta_static_dns1;
+    uint32_t sta_static_dns2;
 } repeater_config_t;
 
 esp_err_t config_storage_init(void);

@@ -354,10 +354,24 @@ static esp_err_t api_config_get_handler(httpd_req_t *req)
         httpd_resp_send_chunk(req, entry, strlen(entry));
     }
 
+    esp_ip4_addr_t sip   = { .addr = s_config->sta_static_ip };
+    esp_ip4_addr_t sgw   = { .addr = s_config->sta_static_gw };
+    esp_ip4_addr_t smask = { .addr = s_config->sta_static_netmask };
+    esp_ip4_addr_t sdns1 = { .addr = s_config->sta_static_dns1 };
+    esp_ip4_addr_t sdns2 = { .addr = s_config->sta_static_dns2 };
     len = snprintf(buf, sizeof(buf),
-        "],\"log_level_global\":%u,\"log_level_microlink\":%u}",
+        "],\"log_level_global\":%u,\"log_level_microlink\":%u,"
+        "\"sta_static_ip_enabled\":%s,"
+        "\"sta_static_ip\":\"" IPSTR "\","
+        "\"sta_static_gw\":\"" IPSTR "\","
+        "\"sta_static_netmask\":\"" IPSTR "\","
+        "\"sta_static_dns1\":\"" IPSTR "\","
+        "\"sta_static_dns2\":\"" IPSTR "\"}",
         s_config->log_level_global,
-        s_config->log_level_microlink);
+        s_config->log_level_microlink,
+        s_config->sta_static_ip_enabled ? "true" : "false",
+        IP2STR(&sip), IP2STR(&sgw), IP2STR(&smask),
+        IP2STR(&sdns1), IP2STR(&sdns2));
     httpd_resp_send_chunk(req, buf, len);
     httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
@@ -868,6 +882,93 @@ static esp_err_t api_config_post_handler(httpd_req_t *req)
         if (ival > CFG_LOG_LEVEL_VERBOSE) ival = CFG_LOG_LEVEL_VERBOSE;
         s_config->log_level_microlink = (uint8_t)ival;
     }
+
+    /* Static IP for STA. Strings empty/missing leave the previous value;
+     * "0.0.0.0" clears the field. Validation only when enabled. */
+    bool new_sta_static_enabled = s_config->sta_static_ip_enabled;
+    uint32_t new_sta_static_ip      = s_config->sta_static_ip;
+    uint32_t new_sta_static_gw      = s_config->sta_static_gw;
+    uint32_t new_sta_static_netmask = s_config->sta_static_netmask;
+    uint32_t new_sta_static_dns1    = s_config->sta_static_dns1;
+    uint32_t new_sta_static_dns2    = s_config->sta_static_dns2;
+
+    if (json_get_int(buf, "sta_static_ip_enabled", &ival)) {
+        new_sta_static_enabled = ival ? true : false;
+    }
+    char ip_buf[16];
+    if (json_get_string(buf, "sta_static_ip", ip_buf, sizeof(ip_buf))) {
+        if (ip_buf[0] == '\0') {
+            new_sta_static_ip = 0;
+        } else {
+            uint32_t parsed = esp_ip4addr_aton(ip_buf);
+            if (parsed == IPADDR_NONE) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid sta_static_ip");
+                return ESP_FAIL;
+            }
+            new_sta_static_ip = parsed;
+        }
+    }
+    if (json_get_string(buf, "sta_static_gw", ip_buf, sizeof(ip_buf))) {
+        if (ip_buf[0] == '\0') {
+            new_sta_static_gw = 0;
+        } else {
+            uint32_t parsed = esp_ip4addr_aton(ip_buf);
+            if (parsed == IPADDR_NONE) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid sta_static_gw");
+                return ESP_FAIL;
+            }
+            new_sta_static_gw = parsed;
+        }
+    }
+    if (json_get_string(buf, "sta_static_netmask", ip_buf, sizeof(ip_buf))) {
+        if (ip_buf[0] == '\0') {
+            new_sta_static_netmask = 0;
+        } else {
+            uint32_t parsed = esp_ip4addr_aton(ip_buf);
+            if (parsed == IPADDR_NONE) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid sta_static_netmask");
+                return ESP_FAIL;
+            }
+            new_sta_static_netmask = parsed;
+        }
+    }
+    if (json_get_string(buf, "sta_static_dns1", ip_buf, sizeof(ip_buf))) {
+        if (ip_buf[0] == '\0') {
+            new_sta_static_dns1 = 0;
+        } else {
+            uint32_t parsed = esp_ip4addr_aton(ip_buf);
+            if (parsed == IPADDR_NONE) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid sta_static_dns1");
+                return ESP_FAIL;
+            }
+            new_sta_static_dns1 = parsed;
+        }
+    }
+    if (json_get_string(buf, "sta_static_dns2", ip_buf, sizeof(ip_buf))) {
+        if (ip_buf[0] == '\0') {
+            new_sta_static_dns2 = 0;
+        } else {
+            uint32_t parsed = esp_ip4addr_aton(ip_buf);
+            if (parsed == IPADDR_NONE) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid sta_static_dns2");
+                return ESP_FAIL;
+            }
+            new_sta_static_dns2 = parsed;
+        }
+    }
+    if (new_sta_static_enabled) {
+        if (new_sta_static_ip == 0 || new_sta_static_netmask == 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                "Static IP requires sta_static_ip and sta_static_netmask");
+            return ESP_FAIL;
+        }
+    }
+    s_config->sta_static_ip_enabled = new_sta_static_enabled;
+    s_config->sta_static_ip         = new_sta_static_ip;
+    s_config->sta_static_gw         = new_sta_static_gw;
+    s_config->sta_static_netmask    = new_sta_static_netmask;
+    s_config->sta_static_dns1       = new_sta_static_dns1;
+    s_config->sta_static_dns2       = new_sta_static_dns2;
 
     esp_err_t save_ret = config_storage_save(s_config);
     if (save_ret != ESP_OK) {

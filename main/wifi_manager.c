@@ -642,8 +642,51 @@ esp_err_t wifi_manager_init(repeater_config_t *config)
     return ESP_OK;
 }
 
+static void apply_sta_ip_config(void)
+{
+    if (!s_sta_netif) return;
+
+    if (s_config->sta_static_ip_enabled &&
+        s_config->sta_static_ip != 0 &&
+        s_config->sta_static_netmask != 0) {
+        esp_netif_dhcpc_stop(s_sta_netif);
+        esp_netif_ip_info_t ip_info = {
+            .ip      = { .addr = s_config->sta_static_ip },
+            .netmask = { .addr = s_config->sta_static_netmask },
+            .gw      = { .addr = s_config->sta_static_gw },
+        };
+        esp_err_t ret = esp_netif_set_ip_info(s_sta_netif, &ip_info);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to set static STA IP info: %s", esp_err_to_name(ret));
+        }
+        if (s_config->sta_static_dns1 != 0) {
+            esp_netif_dns_info_t dns = {
+                .ip = { .type = IPADDR_TYPE_V4,
+                        .u_addr.ip4.addr = s_config->sta_static_dns1 },
+            };
+            esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns);
+        }
+        if (s_config->sta_static_dns2 != 0) {
+            esp_netif_dns_info_t dns = {
+                .ip = { .type = IPADDR_TYPE_V4,
+                        .u_addr.ip4.addr = s_config->sta_static_dns2 },
+            };
+            esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_BACKUP, &dns);
+        }
+        ESP_LOGI(TAG, "STA static IP configured: " IPSTR " gw=" IPSTR " mask=" IPSTR,
+                 IP2STR(&ip_info.ip), IP2STR(&ip_info.gw), IP2STR(&ip_info.netmask));
+    } else {
+        esp_err_t ret = esp_netif_dhcpc_start(s_sta_netif);
+        if (ret != ESP_OK && ret != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+            ESP_LOGW(TAG, "STA DHCP client start: %s", esp_err_to_name(ret));
+        }
+    }
+}
+
 static void configure_sta(void)
 {
+    apply_sta_ip_config();
+
     wifi_config_t sta_cfg = {0};
     strlcpy((char *)sta_cfg.sta.ssid, s_config->sta_ssid, sizeof(sta_cfg.sta.ssid));
     sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;

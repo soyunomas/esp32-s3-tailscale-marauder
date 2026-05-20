@@ -108,6 +108,12 @@ void config_storage_set_defaults(repeater_config_t *config)
     config->usb_hid_keepalive_interval_s = CFG_USB_HID_KEEPALIVE_INTERVAL_DEFAULT_S;
     strlcpy(config->usb_hid_keepalive_key, CFG_USB_HID_KEEPALIVE_KEY_DEFAULT,
             sizeof(config->usb_hid_keepalive_key));
+    config->sta_static_ip_enabled = false;
+    config->sta_static_ip = 0;
+    config->sta_static_gw = 0;
+    config->sta_static_netmask = 0;
+    config->sta_static_dns1 = 0;
+    config->sta_static_dns2 = 0;
 }
 
 esp_err_t config_storage_load(repeater_config_t *config)
@@ -241,6 +247,14 @@ esp_err_t config_storage_load(repeater_config_t *config)
     }
     len = sizeof(config->usb_hid_keepalive_key);
     nvs_get_str(handle, "hid_ka_key", config->usb_hid_keepalive_key, &len);
+    if (nvs_get_u8(handle, "sta_sip_en", &val) == ESP_OK) {
+        config->sta_static_ip_enabled = val != 0;
+    }
+    nvs_get_u32(handle, "sta_sip",   &config->sta_static_ip);
+    nvs_get_u32(handle, "sta_sgw",   &config->sta_static_gw);
+    nvs_get_u32(handle, "sta_smask", &config->sta_static_netmask);
+    nvs_get_u32(handle, "sta_sdns1", &config->sta_static_dns1);
+    nvs_get_u32(handle, "sta_sdns2", &config->sta_static_dns2);
     for (int i = 0; i < CFG_SCHED_RULES_MAX; i++) {
         char key[16];
         scheduler_rule_t *rule = &config->sched_rules[i];
@@ -382,6 +396,12 @@ esp_err_t config_storage_save(const repeater_config_t *config)
     nvs_set_u8(handle, "hid_ka_en", config->usb_hid_keepalive_enabled ? 1 : 0);
     nvs_set_u16(handle, "hid_ka_int", config->usb_hid_keepalive_interval_s);
     nvs_set_str(handle, "hid_ka_key", config->usb_hid_keepalive_key);
+    nvs_set_u8(handle, "sta_sip_en", config->sta_static_ip_enabled ? 1 : 0);
+    nvs_set_u32(handle, "sta_sip",   config->sta_static_ip);
+    nvs_set_u32(handle, "sta_sgw",   config->sta_static_gw);
+    nvs_set_u32(handle, "sta_smask", config->sta_static_netmask);
+    nvs_set_u32(handle, "sta_sdns1", config->sta_static_dns1);
+    nvs_set_u32(handle, "sta_sdns2", config->sta_static_dns2);
     for (int i = 0; i < CFG_SCHED_RULES_MAX; i++) {
         char key[16];
         const scheduler_rule_t *rule = &config->sched_rules[i];
