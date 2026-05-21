@@ -1,4 +1,4 @@
-# ESP32-S3 Tailscale Marauder
+# ESP32-S3 Tailscale Marauder (Advertise Routes)
 
 WiFi Repeater based on **ESP32-S3** with **WPA2-Enterprise** support, embedded **Tailscale** client, and **USB HID DuckyScript** execution capabilities.
 
