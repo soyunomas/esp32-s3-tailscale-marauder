@@ -41,7 +41,7 @@ typedef enum {
 
 typedef struct {
     usb_hid_block_type_t type;
-    uint16_t line;
+    uint32_t line;
     bool seen_else;
 } usb_hid_block_t;
 
@@ -124,7 +124,7 @@ static usb_hid_parse_result_t ok_result(void)
     return result;
 }
 
-static usb_hid_parse_result_t error_result(uint16_t line, const char *message)
+static usb_hid_parse_result_t error_result(uint32_t line, const char *message)
 {
     usb_hid_parse_result_t result = {.ok = false, .line = line};
     strlcpy(result.message, message, sizeof(result.message));
@@ -328,7 +328,7 @@ static bool parse_number_in_range(const char *value, long min_value, long max_va
     return true;
 }
 
-static usb_hid_parse_result_t validate_define(uint16_t line, const char *args)
+static usb_hid_parse_result_t validate_define(uint32_t line, const char *args)
 {
     char buf[192];
     strlcpy(buf, args, sizeof(buf));
@@ -347,7 +347,7 @@ static usb_hid_parse_result_t validate_define(uint16_t line, const char *args)
     return ok_result();
 }
 
-static usb_hid_parse_result_t validate_var(uint16_t line, const char *args)
+static usb_hid_parse_result_t validate_var(uint32_t line, const char *args)
 {
     char buf[192];
     strlcpy(buf, args, sizeof(buf));
@@ -374,7 +374,7 @@ static usb_hid_parse_result_t validate_var(uint16_t line, const char *args)
     return ok_result();
 }
 
-static usb_hid_parse_result_t validate_function(uint16_t line, const char *args)
+static usb_hid_parse_result_t validate_function(uint32_t line, const char *args)
 {
     char buf[96];
     strlcpy(buf, args, sizeof(buf));
@@ -389,7 +389,7 @@ static usb_hid_parse_result_t validate_function(uint16_t line, const char *args)
     return ok_result();
 }
 
-static usb_hid_parse_result_t validate_attackmode(uint16_t line, const char *args)
+static usb_hid_parse_result_t validate_attackmode(uint32_t line, const char *args)
 {
     static const char *const allowed[] = {"HID", "STORAGE", "SERIAL", "MSC"};
     char buf[96];
@@ -405,7 +405,7 @@ static usb_hid_parse_result_t validate_attackmode(uint16_t line, const char *arg
     return ok_result();
 }
 
-static usb_hid_parse_result_t validate_led(uint16_t line, const char *args)
+static usb_hid_parse_result_t validate_led(uint32_t line, const char *args)
 {
     static const char *const allowed[] = {"R", "G", "B", "OFF", "ON"};
     if (!is_one_token(args) || !token_is_one_of(args, allowed, sizeof(allowed) / sizeof(allowed[0]))) {
@@ -414,7 +414,7 @@ static usb_hid_parse_result_t validate_led(uint16_t line, const char *args)
     return ok_result();
 }
 
-static usb_hid_parse_result_t validate_inject_mod(uint16_t line, const char *args)
+static usb_hid_parse_result_t validate_inject_mod(uint32_t line, const char *args)
 {
     static const char *const allowed[] = {"CTRL", "ALT", "SHIFT", "GUI", "WINDOWS", "COMMAND"};
     if (!is_one_token(args) || !token_is_one_of(args, allowed, sizeof(allowed) / sizeof(allowed[0]))) {
@@ -423,7 +423,7 @@ static usb_hid_parse_result_t validate_inject_mod(uint16_t line, const char *arg
     return ok_result();
 }
 
-static usb_hid_parse_result_t validate_exfil(uint16_t line, const char *args)
+static usb_hid_parse_result_t validate_exfil(uint32_t line, const char *args)
 {
     if (!args || args[0] == '\0') return error_result(line, "EXFIL requires a local path");
     if (strstr(args, "://") || args[0] != '/') {
@@ -432,7 +432,7 @@ static usb_hid_parse_result_t validate_exfil(uint16_t line, const char *args)
     return ok_result();
 }
 
-static usb_hid_parse_result_t validate_random_int(uint16_t line, const char *args)
+static usb_hid_parse_result_t validate_random_int(uint32_t line, const char *args)
 {
     if (!args || args[0] == '\0' || strcmp(args, "()") == 0) return ok_result();
     size_t len = strlen(args);
@@ -442,7 +442,7 @@ static usb_hid_parse_result_t validate_random_int(uint16_t line, const char *arg
     return ok_result();
 }
 
-static usb_hid_parse_result_t validate_args(uint16_t line, const char *command,
+static usb_hid_parse_result_t validate_args(uint32_t line, const char *command,
                                             const char *args,
                                             usb_hid_arg_kind_t kind)
 {
@@ -520,7 +520,7 @@ static bool stack_contains(const usb_hid_block_t *stack, size_t depth, usb_hid_b
 }
 
 static usb_hid_parse_result_t push_block(usb_hid_block_t *stack, size_t *depth,
-                                         usb_hid_block_type_t type, uint16_t line)
+                                         usb_hid_block_type_t type, uint32_t line)
 {
     if (*depth >= USB_HID_PARSE_MAX_BLOCK_DEPTH) {
         return error_result(line, "Block nesting is too deep");
@@ -531,7 +531,7 @@ static usb_hid_parse_result_t push_block(usb_hid_block_t *stack, size_t *depth,
 }
 
 static usb_hid_parse_result_t pop_block(usb_hid_block_t *stack, size_t *depth,
-                                        usb_hid_block_type_t type, uint16_t line,
+                                        usb_hid_block_type_t type, uint32_t line,
                                         const char *message)
 {
     if (*depth == 0 || stack[*depth - 1].type != type) {
@@ -541,7 +541,7 @@ static usb_hid_parse_result_t pop_block(usb_hid_block_t *stack, size_t *depth,
     return ok_result();
 }
 
-static usb_hid_parse_result_t validate_block_transition(const char *command, uint16_t line,
+static usb_hid_parse_result_t validate_block_transition(const char *command, uint32_t line,
                                                         usb_hid_block_t *stack, size_t *depth)
 {
     if (strcmp(command, "IF") == 0) return push_block(stack, depth, BLOCK_IF, line);
@@ -576,7 +576,7 @@ usb_hid_parse_result_t usb_hid_macro_validate(const char *script)
     char line_buf[192];
     usb_hid_block_t block_stack[USB_HID_PARSE_MAX_BLOCK_DEPTH];
     size_t block_depth = 0;
-    uint16_t line_no = 1;
+    uint32_t line_no = 1;
     const char *cursor = script;
     while (*cursor) {
         size_t len = 0;

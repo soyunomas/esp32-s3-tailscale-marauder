@@ -14,6 +14,9 @@
 
 static const char *TAG = "tailscale_manager";
 
+#define TAILSCALE_MANAGER_TASK_STACK_SIZE 12288
+#define TAILSCALE_MANAGER_TASK_PRIORITY 5
+
 #if CONFIG_IDF_TARGET_ESP32S3
 #define TAILSCALE_MANAGER_AVAILABLE true
 #else
@@ -30,6 +33,7 @@ static bool s_started;
 static bool s_deferred_stop;
 static bool s_scheduler_enabled = true;
 static esp_timer_handle_t s_boot_timer;
+static uint16_t s_boot_delay_s = CFG_TS_BOOT_DELAY_DEFAULT_S;
 static esp_err_t s_last_error = ESP_OK;
 
 #if CONFIG_IDF_TARGET_ESP32S3
@@ -393,8 +397,10 @@ static void tailscale_schedule_worker(tailscale_worker_op_t op)
         return;
     }
 
-    BaseType_t ret = xTaskCreate(tailscale_worker, "tailscale_mgr", 12288,
-                                 (void *)(intptr_t)op, 5, &s_worker_task);
+    BaseType_t ret = xTaskCreate(tailscale_worker, "tailscale_mgr",
+                                 TAILSCALE_MANAGER_TASK_STACK_SIZE,
+                                 (void *)(intptr_t)op,
+                                 TAILSCALE_MANAGER_TASK_PRIORITY, &s_worker_task);
     if (ret != pdPASS) {
         s_worker_task = NULL;
         s_last_error = ESP_ERR_NO_MEM;
@@ -437,6 +443,7 @@ esp_err_t tailscale_manager_init(const repeater_config_t *config)
 
     tailscale_lock();
     s_config = config->tailscale;
+    s_boot_delay_s = config->tailscale_boot_delay_s;
     s_sta_has_ip = false;
     s_last_error = ESP_OK;
     s_initialized = true;
@@ -458,34 +465,90 @@ esp_err_t tailscale_manager_apply_config(const repeater_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
 
+    bool should_stop;
+    bool should_start;
+    bool should_restart;
+    bool configured;
+    bool enabled;
+    tailscale_state_t state;
+
     tailscale_lock();
     s_config = config->tailscale;
+    s_boot_delay_s = config->tailscale_boot_delay_s;
     s_last_error = ESP_OK;
     s_initialized = true;
-    bool should_stop = !s_config.enabled || !s_scheduler_enabled || !tailscale_is_configured(&s_config);
-    bool should_start = s_config.enabled && s_scheduler_enabled &&
-                        tailscale_is_configured(&s_config) && s_sta_has_ip;
+    configured = tailscale_is_configured(&s_config);
+    enabled = s_config.enabled;
+    should_stop = !enabled || !s_scheduler_enabled || !configured;
+    should_start = enabled && s_scheduler_enabled && configured && s_sta_has_ip;
+    should_restart = s_started && should_start;
+    tailscale_refresh_state_locked();
+    state = s_state;
+    tailscale_unlock();
 
-    /* If MicroLink is already running, restart the device so the new config
-     * (expose_lan, advertise_cidr) takes effect on next boot. */
-    if (s_started && should_start) {
-        tailscale_unlock();
-        ESP_LOGI(TAG, "Config changed, restarting device...");
+    if (should_restart) {
+        ESP_LOGI(TAG, "Config changed while Tailscale is running, restarting device...");
         vTaskDelay(pdMS_TO_TICKS(100));
         esp_restart();
-        return ESP_OK;
-    }
-
-    if (should_stop) {
+    } else if (should_stop) {
         tailscale_schedule_worker(TAILSCALE_WORKER_STOP);
     } else if (should_start) {
         tailscale_schedule_worker(TAILSCALE_WORKER_START_OR_REBIND);
     }
 
     ESP_LOGI(TAG, "Config applied: enabled=%d configured=%d state=%s",
-             s_config.enabled,
-             tailscale_is_configured(&s_config),
-             tailscale_manager_state_to_string(s_state));
+             enabled, configured, tailscale_manager_state_to_string(state));
+    return ESP_OK;
+}
+
+esp_err_t tailscale_manager_apply_runtime_config(const repeater_config_t *config)
+{
+    if (config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bool should_start_now = false;
+#if CONFIG_IDF_TARGET_ESP32S3
+    bool timer_rescheduled = false;
+    bool timer_stopped = false;
+    esp_err_t timer_ret = ESP_OK;
+#endif
+
+    tailscale_lock();
+    s_boot_delay_s = config->tailscale_boot_delay_s;
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (s_boot_timer && esp_timer_is_active(s_boot_timer)) {
+        bool can_start = s_config.enabled && s_scheduler_enabled &&
+                         tailscale_is_configured(&s_config) && s_sta_has_ip;
+        uint64_t boot_ms = esp_timer_get_time() / 1000;
+        uint64_t boot_delay_ms = (uint64_t)s_boot_delay_s * 1000ULL;
+        timer_ret = esp_timer_stop(s_boot_timer);
+        timer_stopped = timer_ret == ESP_OK;
+        if (timer_ret == ESP_OK && can_start) {
+            if (s_boot_delay_s == 0 || boot_ms >= boot_delay_ms) {
+                should_start_now = true;
+            } else {
+                timer_ret = esp_timer_start_once(s_boot_timer,
+                                                 (boot_delay_ms - boot_ms) * 1000ULL);
+                timer_rescheduled = timer_ret == ESP_OK;
+            }
+        }
+    }
+#endif
+    tailscale_unlock();
+
+    ESP_LOGI(TAG, "Runtime tuning applied: tailscale_boot_delay_s=%u",
+             s_boot_delay_s);
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (timer_stopped || timer_rescheduled || should_start_now || timer_ret != ESP_OK) {
+        ESP_LOGI(TAG, "Tailscale boot delay timer update: stopped=%d rescheduled=%d start_now=%d ret=%s",
+                 timer_stopped ? 1 : 0, timer_rescheduled ? 1 : 0,
+                 should_start_now ? 1 : 0, esp_err_to_name(timer_ret));
+    }
+#endif
+    if (should_start_now) {
+        tailscale_schedule_worker(TAILSCALE_WORKER_START_OR_REBIND);
+    }
     return ESP_OK;
 }
 
@@ -540,16 +603,24 @@ void tailscale_manager_on_sta_got_ip(void)
     s_sta_has_ip = true;
     bool should_start = s_config.enabled && s_scheduler_enabled &&
                         tailscale_is_configured(&s_config);
+    uint16_t boot_delay_s = s_boot_delay_s;
 
-    /* On first STA_IP from boot, delay MicroLink startup until 60s.
+    /* On first STA_IP from boot, delay MicroLink startup until configured delay.
      * Without this delay, concurrent MicroLink init + WiFi/lwIP during
      * early boot causes a crash ~6-9s after boot. */
     uint64_t boot_ms = esp_timer_get_time() / 1000;
-    if (should_start && boot_ms < 60000) {
-        ESP_LOGI(TAG, "Delaying Tailscale start (%llus from boot, waiting until 60s)",
-                 (unsigned long long)(boot_ms / 1000));
-        if (s_boot_timer) {
-            esp_timer_start_once(s_boot_timer, (60 * 1000 * 1000) - (boot_ms * 1000));
+    uint64_t boot_delay_ms = (uint64_t)boot_delay_s * 1000ULL;
+    if (should_start && boot_delay_s > 0 && boot_ms < boot_delay_ms) {
+        bool timer_active = s_boot_timer && esp_timer_is_active(s_boot_timer);
+        ESP_LOGI(TAG, "Delaying Tailscale start (%llus from boot, waiting until %us, timer_active=%d)",
+                 (unsigned long long)(boot_ms / 1000), boot_delay_s, timer_active ? 1 : 0);
+        if (s_boot_timer && !timer_active) {
+            esp_err_t ret = esp_timer_start_once(s_boot_timer,
+                                                 (boot_delay_ms - boot_ms) * 1000ULL);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to start Tailscale boot delay timer: %s",
+                         esp_err_to_name(ret));
+            }
         }
         should_start = false;
     }

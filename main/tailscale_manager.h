@@ -40,6 +40,7 @@ typedef struct {
 
 esp_err_t tailscale_manager_init(const repeater_config_t *config);
 esp_err_t tailscale_manager_apply_config(const repeater_config_t *config);
+esp_err_t tailscale_manager_apply_runtime_config(const repeater_config_t *config);
 esp_err_t tailscale_manager_set_scheduler_enabled(bool enabled);
 void tailscale_manager_on_sta_got_ip(void);
 void tailscale_manager_on_sta_disconnected(void);

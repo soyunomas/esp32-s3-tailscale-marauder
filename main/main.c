@@ -8,6 +8,7 @@
 #include "factory_reset.h"
 #include "scheduler_manager.h"
 #include "usb_hid_executor.h"
+#include "usb_hid_macro_store.h"
 
 static const char *TAG = "main";
 static repeater_config_t s_config;
@@ -22,8 +23,10 @@ void app_main(void)
     // Initialize NVS
     ESP_ERROR_CHECK(config_storage_init());
 
-    // Arm physical factory reset via BOOT button (GPIO0).
-    ESP_ERROR_CHECK(factory_reset_init());
+    esp_err_t macro_store_ret = usb_hid_macro_store_init();
+    if (macro_store_ret != ESP_OK) {
+        ESP_LOGE(TAG, "USB HID macro storage unavailable: %s", esp_err_to_name(macro_store_ret));
+    }
 
     // Load configuration
     config_storage_load(&s_config);
@@ -32,11 +35,21 @@ void app_main(void)
     // boot already follows user preferences (lighter logs => faster connect).
     config_storage_apply_log_levels(&s_config);
 
+    // Arm physical factory reset via BOOT button (GPIO0). Short presses are
+    // used later by Dormant Scheduled once the scheduler is initialized.
+    ESP_ERROR_CHECK(factory_reset_init(&s_config));
+
     // Initialize Tailscale wrapper. This does not start MicroLink yet.
     ESP_ERROR_CHECK(tailscale_manager_init(&s_config));
 
     // Initialize and start WiFi
     ESP_ERROR_CHECK(wifi_manager_init(&s_config));
+    if (s_config.sched_mode == SCHED_MODE_DORMANT_SCHEDULED) {
+        ESP_LOGI(TAG, "Dormant Scheduled boot: keeping AP/STA/Tailscale silent until scheduler evaluates");
+        ESP_ERROR_CHECK(wifi_manager_set_ap_enabled(false));
+        ESP_ERROR_CHECK(wifi_manager_set_sta_scheduler_enabled(false));
+        ESP_ERROR_CHECK(tailscale_manager_set_scheduler_enabled(false));
+    }
     ESP_ERROR_CHECK(wifi_manager_start());
 
     // Start the isolated USB HID macro executor. This feature must never

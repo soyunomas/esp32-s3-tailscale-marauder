@@ -18,6 +18,11 @@ typedef struct {
     bool tailscale_effective;
     bool tailscale_desired;
     bool safety_hold;
+    bool dormant_active;
+    bool dormant_time_sync_active;
+    uint32_t dormant_next_retry_s;
+    bool dormant_ap_recovery_active;
+    uint32_t dormant_ap_recovery_remaining_s;
     scheduler_mode_t mode;
     int active_rule;
     int next_rule;
@@ -26,9 +31,11 @@ typedef struct {
     char local_time[SCHED_TIME_STR_LEN];
     char next_change_local[SCHED_TIME_STR_LEN];
     char reason[SCHED_REASON_LEN];
+    char dormant_reason[SCHED_REASON_LEN];
 } scheduler_status_t;
 
 esp_err_t scheduler_manager_init(repeater_config_t *config);
 esp_err_t scheduler_manager_apply_config(repeater_config_t *config);
 esp_err_t scheduler_manager_sync_now(void);
+esp_err_t scheduler_manager_button_wake_ap(void);
 void scheduler_manager_get_status(scheduler_status_t *status);

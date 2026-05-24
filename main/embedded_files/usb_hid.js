@@ -11,6 +11,7 @@
   var listEl=document.getElementById('usbHidMacroList');
   var exampleListEl=document.getElementById('usbHidExampleList');
   var countEl=document.getElementById('usbHidMacroCount');
+  var storageEl=document.getElementById('usbHidStorage');
   var statusEl=document.getElementById('usbHidStatus');
   var keepaliveEnabled=document.getElementById('usbHidKeepaliveEnabled');
   var keepaliveKey=document.getElementById('usbHidKeepaliveKey');
@@ -23,6 +24,7 @@
   var errorLine=0;
   var defaultLayout='es';
   var keepaliveLast=null;
+  var storageInfo=null;
   var examples=[
     {
       name:'Windows shutdown',
@@ -67,6 +69,26 @@
 
   function setStatus(text){
     if(statusEl) statusEl.textContent=text;
+  }
+
+  function formatBytes(bytes){
+    bytes=Number(bytes)||0;
+    if(bytes>=1024*1024) return (bytes/(1024*1024)).toFixed(bytes>=10*1024*1024?1:2)+' MB';
+    if(bytes>=1024) return (bytes/1024).toFixed(bytes>=10*1024?1:2)+' KB';
+    return bytes+' B';
+  }
+
+  function renderStorage(){
+    if(!storageEl) return;
+    if(!storageInfo){
+      storageEl.textContent='Storage unknown';
+      return;
+    }
+    if(storageInfo.available===false){
+      storageEl.textContent='Macro storage unavailable';
+      return;
+    }
+    storageEl.textContent='Storage '+formatBytes(storageInfo.used)+' used / '+formatBytes(storageInfo.free)+' free';
   }
 
   function setState(text){
@@ -276,6 +298,10 @@
       var name=document.createElement('span');
       name.className='usb-hid-macro-name';
       name.textContent=macro.name||'Untitled Macro';
+      var meta=document.createElement('span');
+      meta.className='usb-hid-macro-meta';
+      meta.textContent=(macro.layout||defaultLayout)+' · '+formatBytes(macro.script_len||0);
+      name.appendChild(meta);
       row.appendChild(name);
 
       var actions=document.createElement('div');
@@ -293,8 +319,7 @@
       run.className='usb-hid-icon-btn';
       run.textContent='Run';
       run.addEventListener('click',function(){
-        loadMacro(macro);
-        executeMacro(macro);
+        loadMacro(macro).then(function(full){executeMacro(full)});
       });
       actions.appendChild(run);
 
@@ -345,11 +370,27 @@
   }
 
   function loadMacro(macro){
-    currentId=macro.id||0;
-    nameInput.value=macro.name||'';
-    if(layoutInput) layoutInput.value=macro.layout||defaultLayout;
-    scriptInput.value=macro.script||'';
-    setStatus('Loaded: '+(macro.name||'Untitled Macro'));
+    return loadFullMacro(macro).then(function(full){
+      currentId=full.id||0;
+      nameInput.value=full.name||'';
+      if(layoutInput) layoutInput.value=full.layout||defaultLayout;
+      scriptInput.value=full.script||'';
+      setStatus('Loaded: '+(full.name||'Untitled Macro')+' ('+formatBytes(full.script_len||full.script.length)+')');
+      return full;
+    }).catch(function(error){
+      setStatus('Load failed: '+cleanErrorText(error&&error.message));
+      throw error;
+    });
+  }
+
+  function loadFullMacro(macro){
+    if(macro&&typeof macro.script==='string') return Promise.resolve(macro);
+    if(!macro||!macro.id) return Promise.reject(new Error('macro id missing'));
+    return fetch('/api/usb-hid/macros/'+macro.id,{headers:authHeaders()})
+    .then(function(r){
+      if(!r.ok) return r.text().then(function(text){throw new Error(cleanErrorText(text)||'load failed')});
+      return r.json();
+    });
   }
 
   function loadExample(example){
@@ -367,11 +408,15 @@
       return r.json();
     }).then(function(data){
       macros=Array.isArray(data.macros)?data.macros:[];
+      storageInfo=data.storage||null;
       renderMacros();
+      renderStorage();
       setStatus('Idle');
     }).catch(function(){
       macros=[];
+      storageInfo={available:false};
       renderMacros();
+      renderStorage();
       setStatus('Macro storage unavailable');
     });
   }
@@ -389,14 +434,14 @@
       headers:authHeaders({'Content-Type':'application/json'}),
       body:JSON.stringify(macro)
     }).then(function(r){
-      if(!r.ok) throw new Error('save failed');
+      if(!r.ok) return r.text().then(function(text){throw new Error(cleanErrorText(text)||'save failed')});
       return r.json();
     }).then(function(saved){
       currentId=saved.id||0;
       setStatus('Saved: '+(saved.name||macro.name));
       loadMacros();
-    }).catch(function(){
-      setStatus('Save failed');
+    }).catch(function(error){
+      setStatus('Save failed: '+cleanErrorText(error&&error.message));
     }).finally(function(){
       saveBtn.disabled=false;
     });
@@ -424,20 +469,20 @@
       setStatus('Macro name is empty');
       return;
     }
-    var updated={id:macro.id,name:next,layout:macro.layout||defaultLayout,script:macro.script||''};
+    var updated={id:macro.id,name:next,layout:macro.layout||defaultLayout};
     fetch('/api/usb-hid/macros/'+macro.id,{
       method:'PUT',
       headers:authHeaders({'Content-Type':'application/json'}),
       body:JSON.stringify(updated)
     }).then(function(r){
-      if(!r.ok) throw new Error('rename failed');
+      if(!r.ok) return r.text().then(function(text){throw new Error(cleanErrorText(text)||'rename failed')});
       return r.json();
     }).then(function(saved){
       if(currentId===macro.id) nameInput.value=saved.name||next;
       setStatus('Renamed: '+(saved.name||next));
       loadMacros();
-    }).catch(function(){
-      setStatus('Rename failed');
+    }).catch(function(error){
+      setStatus('Rename failed: '+cleanErrorText(error&&error.message));
     });
   }
 

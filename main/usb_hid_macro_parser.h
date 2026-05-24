@@ -8,7 +8,7 @@
 
 typedef struct {
     bool ok;
-    uint16_t line;
+    uint32_t line;
     char message[USB_HID_PARSE_ERROR_LEN];
 } usb_hid_parse_result_t;
 

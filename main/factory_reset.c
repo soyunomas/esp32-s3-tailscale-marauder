@@ -1,6 +1,7 @@
 #include "factory_reset.h"
 
 #include "config_storage.h"
+#include "scheduler_manager.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -13,8 +14,10 @@ static const char *TAG = "factory_reset";
 #define SAMPLE_MS          50U
 #define VALID_MIN_MS       5000U
 #define VALID_MAX_MS       10000U
+#define SHORT_PRESS_MIN_MS 50U
 
 static TaskHandle_t s_factory_reset_task = NULL;
+static repeater_config_t *s_config = NULL;
 
 static void factory_reset_task(void *arg)
 {
@@ -55,6 +58,16 @@ static void factory_reset_task(void *arg)
                     esp_restart();
                 } else if (cancelled) {
                     ESP_LOGW(TAG, "BOOT released after cancelled hold, ignoring");
+                } else if (held_ms >= SHORT_PRESS_MIN_MS &&
+                           s_config &&
+                           s_config->sched_mode == SCHED_MODE_DORMANT_SCHEDULED &&
+                           s_config->dormant_button_wake_enabled) {
+                    esp_err_t ret = scheduler_manager_button_wake_ap();
+                    if (ret == ESP_OK) {
+                        ESP_LOGI(TAG, "BOOT short press enabled dormant AP wake");
+                    } else {
+                        ESP_LOGI(TAG, "BOOT short press ignored: dormant AP wake unavailable");
+                    }
                 } else {
                     ESP_LOGI(TAG, "BOOT released after %lu ms, ignoring",
                              (unsigned long)held_ms);
@@ -70,8 +83,9 @@ static void factory_reset_task(void *arg)
     }
 }
 
-esp_err_t factory_reset_init(void)
+esp_err_t factory_reset_init(repeater_config_t *config)
 {
+    s_config = config;
     if (s_factory_reset_task) return ESP_OK;
 
     gpio_config_t cfg = {

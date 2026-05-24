@@ -3,6 +3,10 @@
   var authHeader='';
   var NET_MODE_REPEATER=0;
   var NET_MODE_TS_GATEWAY=1;
+  var SCHED_MODE_ALWAYS_ON=0;
+  var SCHED_MODE_SCHEDULED=1;
+  var SCHED_MODE_MANUAL_OFF=2;
+  var SCHED_MODE_DORMANT_SCHEDULED=3;
   var schedRules=[];
   var schedMode=0;
   var schedMacroOptions=[];
@@ -125,6 +129,16 @@
     setTimeout(function(){t.classList.remove('show')},3000);
   }
 
+  function numberInRange(id,min,max,label){
+    var el=document.getElementById(id);
+    var n=parseInt(el.value,10);
+    if(isNaN(n)||n<min||n>max){
+      toast(label+' must be '+min+'-'+max,'error');
+      return null;
+    }
+    return n;
+  }
+
   // Modal system
   function showModal(title, body, onConfirm, okText, danger){
     var overlay = document.getElementById('modalOverlay');
@@ -163,6 +177,12 @@
     if(d>0) return d+'d '+h+'h '+m+'m';
     if(h>0) return h+'h '+m+'m';
     return m+'m '+Math.floor(s%60)+'s';
+  }
+
+  function formatBytes(bytes){
+    bytes=Number(bytes)||0;
+    if(bytes>=1024*1024) return (bytes/(1024*1024)).toFixed(1)+' MB';
+    return Math.round(bytes/1024)+' KB';
   }
 
   function updateWifiControl(d){
@@ -240,6 +260,8 @@
       document.getElementById('apMAC').textContent='AP: '+(d.ap_mac||'--');
       document.getElementById('freeHeap').textContent=Math.round(d.free_heap/1024)+' KB';
       document.getElementById('uptime').textContent='Uptime: '+formatUptime(d.uptime);
+      document.getElementById('macroStorageFree').textContent=formatBytes(d.macro_storage_free);
+      document.getElementById('macroStorageSlots').textContent=(d.macro_slots_free||0)+'/'+(d.macro_slots_max||0)+' slots free';
       updateWifiControl(d);
     }).catch(function(){});
   }
@@ -320,8 +342,8 @@
       document.getElementById('tsCidrGroup').style.display=exposeLan?'block':'none';
       document.getElementById('tsSubnetMode').value=exposeLan?NET_MODE_TS_GATEWAY:NET_MODE_REPEATER;
       var savedCidr=cfg.advertise_cidr||'';
-      // Si no hay valor guardado o es el default histórico "192.168.24.0/24",
-      // y la STA está conectada al AP padre, sugerir su red /24 como default.
+      // If no value is saved, or it is the historical default "192.168.24.0/24",
+      // and STA is connected to the parent AP, suggest that /24 as the default.
       var derived=deriveStaCidr();
       if((!savedCidr || savedCidr==='192.168.24.0/24') && derived){
         document.getElementById('tsAdvertiseCidr').value=derived;
@@ -362,6 +384,11 @@
       }).then(function(d){
         document.getElementById('tsAuthKey').value='';
         toast(d.message||'Tailscale saved','success');
+        if(d.rebooting||(d.message||'').toLowerCase().indexOf('rebooting')>=0){
+          setTailscaleStatusUI({available:true,state:'rebooting',vpn_ip:'--',subnet_route_state:'rebooting'});
+          toast('Rebooting; reconnect to the AP or device IP in about a minute','success');
+          return;
+        }
         loadTailscaleConfig();
         updateTailscaleStatus();
       }).catch(function(){toast('Tailscale save failed','error')});
@@ -571,6 +598,74 @@
     applyLogLevelsRequest(lg, lm);
   };
 
+  function setRuntimeConfigUI(cfg){
+    document.getElementById('rtTsBootDelay').value=cfg.tailscale_boot_delay_s!==undefined?cfg.tailscale_boot_delay_s:60;
+    document.getElementById('rtWifiRecovery').value=cfg.wifi_recovery_cooldown_s!==undefined?cfg.wifi_recovery_cooldown_s:60;
+    document.getElementById('rtSchedPoll').value=cfg.scheduler_poll_interval_s!==undefined?cfg.scheduler_poll_interval_s:15;
+    document.getElementById('rtNtp1').value=cfg.ntp_server_1||'pool.ntp.org';
+    document.getElementById('rtNtp2').value=cfg.ntp_server_2||'time.google.com';
+    document.getElementById('rtProxyBuf').value=cfg.proxy_buf_size!==undefined?cfg.proxy_buf_size:1460;
+    document.getElementById('rtProxySock').value=cfg.proxy_socket_timeout_s!==undefined?cfg.proxy_socket_timeout_s:10;
+    document.getElementById('rtProxyIdle').value=cfg.proxy_idle_timeout_s!==undefined?cfg.proxy_idle_timeout_s:30;
+    document.getElementById('rtProxyAccept').value=cfg.proxy_accept_retry_ms!==undefined?cfg.proxy_accept_retry_ms:100;
+    document.getElementById('rtProxyBacklog').value=cfg.proxy_listen_backlog!==undefined?cfg.proxy_listen_backlog:3;
+    document.getElementById('rtScanMin').value=cfg.scan_active_min_ms!==undefined?cfg.scan_active_min_ms:100;
+    document.getElementById('rtScanMax').value=cfg.scan_active_max_ms!==undefined?cfg.scan_active_max_ms:300;
+    document.getElementById('rtScanTimeout').value=cfg.scan_timeout_s!==undefined?cfg.scan_timeout_s:10;
+    document.getElementById('rtPingCount').value=cfg.ping_count!==undefined?cfg.ping_count:3;
+    document.getElementById('rtPingInterval').value=cfg.ping_interval_ms!==undefined?cfg.ping_interval_ms:500;
+    document.getElementById('rtPingTimeout').value=cfg.ping_timeout_ms!==undefined?cfg.ping_timeout_ms:2000;
+    document.getElementById('rtPingWait').value=cfg.ping_total_wait_s!==undefined?cfg.ping_total_wait_s:10;
+  }
+
+  function loadRuntimeConfig(){
+    authFetch('/api/runtime/config').then(function(r){return r.json()}).then(setRuntimeConfigUI).catch(function(){});
+  }
+
+  window.saveRuntimeConfig=function(){
+    var data={};
+    var n;
+    n=numberInRange('rtTsBootDelay',0,300,'Tailscale boot delay'); if(n===null)return; data.tailscale_boot_delay_s=n;
+    n=numberInRange('rtWifiRecovery',5,600,'WiFi recovery cooldown'); if(n===null)return; data.wifi_recovery_cooldown_s=n;
+    n=numberInRange('rtSchedPoll',5,300,'Scheduler poll interval'); if(n===null)return; data.scheduler_poll_interval_s=n;
+    var ntp1=document.getElementById('rtNtp1').value.trim();
+    var ntp2=document.getElementById('rtNtp2').value.trim();
+    if(!ntp1||/\s/.test(ntp1)||ntp1.length>63){toast('NTP server 1 is invalid','error');return}
+    if(!ntp2||/\s/.test(ntp2)||ntp2.length>63){toast('NTP server 2 is invalid','error');return}
+    data.ntp_server_1=ntp1;
+    data.ntp_server_2=ntp2;
+    n=numberInRange('rtProxyBuf',512,4096,'Proxy buffer size'); if(n===null)return; data.proxy_buf_size=n;
+    n=numberInRange('rtProxySock',1,120,'Proxy socket timeout'); if(n===null)return; data.proxy_socket_timeout_s=n;
+    n=numberInRange('rtProxyIdle',5,600,'Proxy idle timeout'); if(n===null)return; data.proxy_idle_timeout_s=n;
+    n=numberInRange('rtProxyAccept',10,2000,'Proxy accept retry'); if(n===null)return; data.proxy_accept_retry_ms=n;
+    n=numberInRange('rtProxyBacklog',1,8,'Proxy listen backlog'); if(n===null)return; data.proxy_listen_backlog=n;
+    n=numberInRange('rtScanMin',30,1000,'Scan active min'); if(n===null)return; data.scan_active_min_ms=n;
+    var scanMin=n;
+    n=numberInRange('rtScanMax',50,2000,'Scan active max'); if(n===null)return; data.scan_active_max_ms=n;
+    if(n<scanMin){toast('Scan active max must be >= min','error');return}
+    n=numberInRange('rtScanTimeout',3,60,'Scan timeout'); if(n===null)return; data.scan_timeout_s=n;
+    n=numberInRange('rtPingCount',1,10,'Ping count'); if(n===null)return; data.ping_count=n;
+    n=numberInRange('rtPingInterval',100,5000,'Ping interval'); if(n===null)return; data.ping_interval_ms=n;
+    n=numberInRange('rtPingTimeout',500,10000,'Ping timeout'); if(n===null)return; data.ping_timeout_ms=n;
+    n=numberInRange('rtPingWait',3,60,'Ping total wait'); if(n===null)return; data.ping_total_wait_s=n;
+
+    var btn=document.getElementById('btnApplyRuntimeTuning');
+    var old=btn?btn.textContent:'';
+    if(btn){btn.disabled=true;btn.textContent='Applying...'}
+    authFetch('/api/runtime/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+    .then(function(r){
+      if(!r.ok) throw new Error('Runtime tuning save failed');
+      return r.json();
+    }).then(function(d){
+      toast(d.requires_reboot?'Saved. Reboot recommended.':(d.message||'Runtime tuning saved'),'success');
+      loadRuntimeConfig();
+      if(btn){btn.textContent='Applied \u2713';setTimeout(function(){btn.disabled=false;btn.textContent=old||'Apply runtime tuning'},1500)}
+    }).catch(function(e){
+      toast(e.message||'Runtime tuning save failed','error');
+      if(btn){btn.disabled=false;btn.textContent=old||'Apply runtime tuning'}
+    });
+  };
+
   window.factoryReset=function(){
     showModal('⚠️ Factory Reset', 'All settings will be erased (WiFi, AP, Credentials, Tailscale). The device will reboot with defaults. This cannot be undone.', function(){
       showModal('Confirm Factory Reset', 'Are you absolutely sure?', function(){
@@ -711,7 +806,10 @@
   }
 
   function schedModeLabel(mode){
-    return mode===1?'Scheduled':(mode===2?'Manual off':'Always on');
+    if(mode===SCHED_MODE_DORMANT_SCHEDULED) return 'Dormant Scheduled';
+    if(mode===SCHED_MODE_SCHEDULED) return 'Scheduled';
+    if(mode===SCHED_MODE_MANUAL_OFF) return 'Manual off';
+    return 'Always on';
   }
 
   function schedDaysLabel(mask){
@@ -768,14 +866,19 @@
     document.querySelectorAll('.seg-btn').forEach(function(b){
       b.classList.toggle('active',parseInt(b.dataset.mode,10)===schedMode);
     });
+    renderActivationProfile();
     var warn=document.getElementById('schedWarning');
     if(!warn) return;
     var hasEnabledRules=schedRules.some(function(r){return !!r.enabled});
-    if(schedMode===2){
+    if(schedMode===SCHED_MODE_MANUAL_OFF){
       warn.textContent='Manual off: AP radio is permanently disabled. STA and Tailscale remain connected if configured.';
       warn.style.display='block';
       warn.className='notice danger';
-    }else if(schedMode===1){
+    }else if(schedMode===SCHED_MODE_DORMANT_SCHEDULED){
+      warn.textContent='Dormant Scheduled: AP/STA/TS stay off outside active rules. BOOT short press can open temporary AP if enabled.';
+      warn.style.display='block';
+      warn.className='notice warning';
+    }else if(schedMode===SCHED_MODE_SCHEDULED){
       warn.textContent='Scheduled: AP/STA/TS states will follow the rules below. AP is kept ON if STA is offline.';
       warn.style.display='block';
       warn.className='notice warning';
@@ -790,6 +893,32 @@
 
   window.setSchedulerMode=function(mode){
     schedMode=mode;
+    renderSchedulerMode();
+  };
+
+  function currentActivationProfile(){
+    if(schedMode===SCHED_MODE_DORMANT_SCHEDULED) return 'dormant';
+    if(schedMode===SCHED_MODE_SCHEDULED) return 'home-stealth';
+    return 'normal';
+  }
+
+  function renderActivationProfile(){
+    var profile=currentActivationProfile();
+    document.querySelectorAll('.profile-btn').forEach(function(btn){
+      btn.classList.toggle('active',btn.dataset.profile===profile);
+    });
+    var fields=document.getElementById('dormantFields');
+    if(fields) fields.style.display=schedMode===SCHED_MODE_DORMANT_SCHEDULED?'block':'none';
+  }
+
+  window.setActivationProfile=function(profile){
+    if(profile==='dormant'){
+      schedMode=SCHED_MODE_DORMANT_SCHEDULED;
+    }else if(profile==='home-stealth'){
+      schedMode=SCHED_MODE_SCHEDULED;
+    }else{
+      schedMode=SCHED_MODE_ALWAYS_ON;
+    }
     renderSchedulerMode();
   };
 
@@ -897,6 +1026,11 @@
       var ts=s.tailscale_effective?'On':'Off';
       var next=s.next_change_local&&s.next_change_local!=='--'?s.next_change_local:'No scheduled change';
       var reason=s.reason||state;
+      if(s.dormant_reason==='retry_pending'&&s.dormant_next_retry_s){
+        reason+=' · retry in '+s.dormant_next_retry_s+'s';
+      }else if(s.dormant_ap_recovery_active&&s.dormant_ap_recovery_remaining_s){
+        reason+=' · AP recovery '+s.dormant_ap_recovery_remaining_s+'s';
+      }
       var dash=document.getElementById('schedDashState');
       if(dash){
         dash.textContent=state;
@@ -928,6 +1062,13 @@
         schedMacroOptions=[];
       }).then(function(){
         schedMode=cfg.mode||0;
+        document.getElementById('dormantTimeSyncAttempt').value=cfg.dormant_time_sync_attempt_s!==undefined?cfg.dormant_time_sync_attempt_s:120;
+        document.getElementById('dormantTimeSyncRetry').value=cfg.dormant_time_sync_retry_s!==undefined?cfg.dormant_time_sync_retry_s:900;
+        document.getElementById('dormantApRecoveryEnabled').checked=!!cfg.dormant_ap_recovery_enabled;
+        document.getElementById('dormantApRecoveryWindow').value=cfg.dormant_ap_recovery_window_s!==undefined?cfg.dormant_ap_recovery_window_s:300;
+        document.getElementById('dormantButtonWakeEnabled').checked=cfg.dormant_button_wake_enabled!==false;
+        document.getElementById('dormantButtonWakeS').value=cfg.dormant_button_wake_s!==undefined?cfg.dormant_button_wake_s:300;
+        document.getElementById('dormantKeepApOffDuringActive').checked=cfg.dormant_keep_ap_off_during_active_window!==false;
         schedRules=(cfg.rules||[]).filter(function(r){return r.enabled||r.days||r.start_min||r.end_min||r.note||r.usb_hid_macro_id});
         schedRules.forEach(function(r){
           if(r.sta_enabled===undefined) r.sta_enabled=true;
@@ -952,6 +1093,19 @@
       }
     }
     var data={timezone:document.getElementById('schedTimezone').value,mode:schedMode};
+    data.dormant_time_sync_attempt_s=numberInRange('dormantTimeSyncAttempt',30,600,'Dormant time sync attempt'); if(data.dormant_time_sync_attempt_s===null)return;
+    data.dormant_time_sync_retry_s=numberInRange('dormantTimeSyncRetry',60,86400,'Dormant time sync retry'); if(data.dormant_time_sync_retry_s===null)return;
+    data.dormant_ap_recovery_enabled=document.getElementById('dormantApRecoveryEnabled').checked;
+    data.dormant_ap_recovery_window_s=numberInRange('dormantApRecoveryWindow',30,1800,'Dormant AP recovery window'); if(data.dormant_ap_recovery_window_s===null)return;
+    data.dormant_button_wake_enabled=document.getElementById('dormantButtonWakeEnabled').checked;
+    data.dormant_button_wake_s=numberInRange('dormantButtonWakeS',30,1800,'Dormant button wake duration'); if(data.dormant_button_wake_s===null)return;
+    data.dormant_keep_ap_off_during_active_window=document.getElementById('dormantKeepApOffDuringActive').checked;
+    if(schedMode===SCHED_MODE_DORMANT_SCHEDULED &&
+       !data.dormant_ap_recovery_enabled &&
+       !data.dormant_button_wake_enabled){
+      toast('Dormant Scheduled needs AP recovery or BOOT button wake','error');
+      return;
+    }
     for(var i=0;i<8;i++){
       var r=schedRules[i]||{enabled:false,days:0,start_min:0,end_min:0,ap_enabled:true,sta_enabled:true,tailscale_enabled:true,usb_hid_macro_id:0,note:''};
       data['rule'+i+'_enabled']=!!r.enabled;
@@ -1023,6 +1177,7 @@
       updateSubnetModeUI();
     }).catch(function(){});
     loadTailscaleConfig();
+    loadRuntimeConfig();
     updateStatus();
     updateTailscaleStatus();
     loadClients();

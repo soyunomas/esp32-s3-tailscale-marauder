@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -46,8 +47,8 @@ typedef struct {
 } usb_hid_exec_request_t;
 
 typedef struct {
-    uint16_t offset;
-    uint16_t len;
+    size_t offset;
+    size_t len;
 } usb_hid_line_ref_t;
 
 #define USB_HID_EXEC_CALL_DEPTH 4
@@ -110,7 +111,7 @@ const char *usb_hid_exec_state_name(usb_hid_exec_state_t state)
 }
 
 static void set_status(usb_hid_exec_state_t state, const usb_hid_macro_t *macro,
-                       uint16_t current_line, uint16_t total_lines,
+                       uint32_t current_line, uint32_t total_lines,
                        const char *message)
 {
     if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -135,13 +136,13 @@ void usb_hid_executor_get_status(usb_hid_exec_status_t *status)
     if (s_lock) xSemaphoreGive(s_lock);
 }
 
-static uint16_t count_lines(const char *script)
+static uint32_t count_lines(const char *script)
 {
-    uint16_t count = 0;
+    uint32_t count = 0;
     bool has_content = false;
     for (size_t i = 0; script[i] != '\0'; i++) {
         if (script[i] != '\r' && script[i] != '\n') has_content = true;
-        if (script[i] == '\n') count++;
+        if (script[i] == '\n' && count < UINT32_MAX) count++;
     }
     return has_content ? count + 1 : 0;
 }
@@ -274,8 +275,8 @@ static size_t build_line_refs(const char *script, usb_hid_line_ref_t *lines, siz
     while (script[pos] != '\0' && count < max_lines) {
         size_t start = pos;
         while (script[pos] != '\0' && script[pos] != '\n' && script[pos] != '\r') pos++;
-        lines[count].offset = (uint16_t)start;
-        lines[count].len = (uint16_t)(pos - start);
+        lines[count].offset = start;
+        lines[count].len = pos - start;
         count++;
         if (script[pos] == '\r') pos++;
         if (script[pos] == '\n') pos++;
@@ -1042,11 +1043,11 @@ static void dry_run_status_for_command(const char *command, const char *args,
     }
 }
 
-static bool preflight_real_script(const char *script, const char *layout, uint16_t *line_out,
+static bool preflight_real_script(const char *script, const char *layout, uint32_t *line_out,
                                   char *message, size_t message_size)
 {
     const char *cursor = script;
-    uint16_t line_no = 1;
+    uint32_t line_no = 1;
     char line_buf[192];
 
     while (*cursor) {
@@ -1079,7 +1080,7 @@ static bool preflight_real_script(const char *script, const char *layout, uint16
         cursor += len;
         if (*cursor == '\r') cursor++;
         if (*cursor == '\n') cursor++;
-        line_no++;
+        if (line_no < UINT32_MAX) line_no++;
     }
 
     return true;
@@ -1358,15 +1359,15 @@ static void run_macro_dry(const usb_hid_macro_t *macro)
     usb_hid_parse_result_t parsed = usb_hid_macro_validate(macro->script);
     if (!parsed.ok) {
         char msg[96];
-        snprintf(msg, sizeof(msg), "Line %u: %.80s", parsed.line, parsed.message);
+        snprintf(msg, sizeof(msg), "Line %" PRIu32 ": %.80s", parsed.line, parsed.message);
         set_status(USB_HID_EXEC_ERROR, macro, parsed.line, count_lines(macro->script), msg);
         return;
     }
 
-    uint16_t total = count_lines(macro->script);
+    uint32_t total = count_lines(macro->script);
     uint32_t started = xTaskGetTickCount() * portTICK_PERIOD_MS;
     const char *cursor = macro->script;
-    uint16_t line_no = 1;
+    uint32_t line_no = 1;
     char line_buf[192];
 
     while (*cursor) {
@@ -1421,7 +1422,7 @@ static void run_macro_dry(const usb_hid_macro_t *macro)
         cursor += len;
         if (*cursor == '\r') cursor++;
         if (*cursor == '\n') cursor++;
-        line_no++;
+        if (line_no < UINT32_MAX) line_no++;
     }
 
     set_status(USB_HID_EXEC_DONE, macro, total, total, "Dry run complete");
@@ -1430,15 +1431,15 @@ static void run_macro_dry(const usb_hid_macro_t *macro)
 static void run_macro_real(const usb_hid_macro_t *macro)
 {
     usb_hid_parse_result_t parsed = usb_hid_macro_validate(macro->script);
-    uint16_t total = count_lines(macro->script);
+    uint32_t total = count_lines(macro->script);
     if (!parsed.ok) {
         char msg[96];
-        snprintf(msg, sizeof(msg), "Line %u: %.80s", parsed.line, parsed.message);
+        snprintf(msg, sizeof(msg), "Line %" PRIu32 ": %.80s", parsed.line, parsed.message);
         set_status(USB_HID_EXEC_ERROR, macro, parsed.line, total, msg);
         return;
     }
 
-    uint16_t bad_line = 0;
+    uint32_t bad_line = 0;
     char preflight_msg[96];
     const char *layout = usb_hid_macro_layout_valid(macro->layout) ?
                          macro->layout : USB_HID_MACRO_DEFAULT_LAYOUT;
@@ -1459,8 +1460,8 @@ static void run_macro_real(const usb_hid_macro_t *macro)
         return;
     }
     size_t line_count = build_line_refs(macro->script, lines, max_lines);
-    total = (uint16_t)line_count;
-    uint16_t *loop_counts = calloc(max_lines, sizeof(*loop_counts));
+    total = line_count > UINT32_MAX ? UINT32_MAX : (uint32_t)line_count;
+    uint32_t *loop_counts = calloc(max_lines, sizeof(*loop_counts));
     if (!loop_counts) {
         free(lines);
         set_status(USB_HID_EXEC_ERROR, macro, 0, total, "Loop counter allocation failed");
@@ -1477,7 +1478,7 @@ static void run_macro_real(const usb_hid_macro_t *macro)
     char line_buf[192];
 
     while (pc < line_count) {
-        uint16_t line_no = (uint16_t)(pc + 1);
+        uint32_t line_no = pc + 1 > UINT32_MAX ? UINT32_MAX : (uint32_t)(pc + 1);
         if (s_stop_requested) {
             usb_hid_device_release();
             set_status(USB_HID_EXEC_DONE, macro, line_no, total, "Stopped");
@@ -1660,7 +1661,7 @@ static void run_macro_real(const usb_hid_macro_t *macro)
                     long count = strtol(args, NULL, 10);
                     if (count <= 0) {
                         pc++;
-                    } else if (loop_counts[pc] < (uint16_t)count) {
+                    } else if (loop_counts[pc] < (uint32_t)count) {
                         loop_counts[pc]++;
                         set_status(USB_HID_EXEC_RUNNING, macro, line_no, total, "LOOP repeat");
                         pc = 0;
@@ -1723,7 +1724,7 @@ static void run_macro_real(const usb_hid_macro_t *macro)
         }
         if (ret != ESP_OK) {
             usb_hid_device_release();
-            snprintf(message, sizeof(message), "Line %u failed: %s", line_no, esp_err_to_name(ret));
+            snprintf(message, sizeof(message), "Line %" PRIu32 " failed: %s", line_no, esp_err_to_name(ret));
             set_status(USB_HID_EXEC_ERROR, macro, line_no, total, message);
             free(loop_counts);
             free(lines);
@@ -1902,6 +1903,7 @@ static void executor_task(void *arg)
                 if (s_hid_io_lock) xSemaphoreGive(s_hid_io_lock);
             }
             s_executing = false;
+            usb_hid_macro_free(&req->macro);
             free(req);
             req = NULL;
         }
@@ -1943,7 +1945,7 @@ esp_err_t usb_hid_executor_init(void)
 
 esp_err_t usb_hid_executor_start(const usb_hid_macro_t *macro)
 {
-    if (!macro) return ESP_ERR_INVALID_ARG;
+    if (!macro || !macro->script || macro->script_len == 0) return ESP_ERR_INVALID_ARG;
 
     usb_hid_exec_status_t status;
     usb_hid_executor_get_status(&status);
@@ -1954,11 +1956,22 @@ esp_err_t usb_hid_executor_start(const usb_hid_macro_t *macro)
 
     usb_hid_exec_request_t *req = calloc(1, sizeof(*req));
     if (!req) return ESP_ERR_NO_MEM;
-    req->macro = *macro;
+    req->macro.id = macro->id;
+    req->macro.script_len = macro->script_len;
+    strlcpy(req->macro.name, macro->name, sizeof(req->macro.name));
+    strlcpy(req->macro.layout, macro->layout, sizeof(req->macro.layout));
+    req->macro.script = malloc(macro->script_len + 1);
+    if (!req->macro.script) {
+        free(req);
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(req->macro.script, macro->script, macro->script_len);
+    req->macro.script[macro->script_len] = '\0';
     s_stop_requested = false;
     s_macro_reserved = true;
     if (xQueueSend(s_queue, &req, 0) != pdTRUE) {
         s_macro_reserved = false;
+        usb_hid_macro_free(&req->macro);
         free(req);
         return ESP_ERR_INVALID_STATE;
     }
@@ -1985,6 +1998,7 @@ esp_err_t usb_hid_executor_panic_stop(void)
     if (s_queue) {
         usb_hid_exec_request_t *queued = NULL;
         while (xQueueReceive(s_queue, &queued, 0) == pdTRUE) {
+            usb_hid_macro_free(&queued->macro);
             free(queued);
             queued = NULL;
         }

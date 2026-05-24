@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <inttypes.h>
 #include "web_server.h"
 #include "wifi_manager.h"
 #include "config_storage.h"
@@ -150,6 +151,11 @@ static esp_err_t api_status_handler(httpd_req_t *req)
 
     uint32_t free_heap = esp_get_free_heap_size();
     uint32_t uptime_sec = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000);
+    usb_hid_macro_storage_stats_t macro_stats;
+    memset(&macro_stats, 0, sizeof(macro_stats));
+    if (usb_hid_macro_store_stats(&macro_stats) != ESP_OK) {
+        macro_stats.max_macros = USB_HID_MACRO_MAX_METADATA;
+    }
 
     char esc_ssid[68];
     json_escape(esc_ssid, sizeof(esc_ssid), status.sta_ssid);
@@ -159,14 +165,17 @@ static esp_err_t api_status_handler(httpd_req_t *req)
     snprintf(sta_mac, sizeof(sta_mac), MACSTR, MAC2STR(status.sta_mac));
     snprintf(ap_mac, sizeof(ap_mac), MACSTR, MAC2STR(status.ap_mac));
 
-    char buf[512];
+    char buf[768];
     snprintf(buf, sizeof(buf),
         "{\"sta_connected\":%s,\"sta_ssid\":\"%s\",\"sta_rssi\":%d,"
         "\"sta_ip\":\"%s\",\"ap_clients\":%d,\"ap_ip\":\"%s\","
         "\"sta_mac\":\"%s\",\"ap_mac\":\"%s\","
         "\"sta_retry_count\":%u,\"sta_recovery\":%s,\"sta_paused\":%s,"
         "\"sta_scheduler_enabled\":%s,\"ap_enabled\":%s,"
-        "\"sta_next_retry_s\":%u,\"free_heap\":%lu,\"uptime\":%lu}",
+        "\"sta_next_retry_s\":%u,\"free_heap\":%lu,\"uptime\":%lu,"
+        "\"macro_storage_available\":%s,"
+        "\"macro_slots_used\":%lu,\"macro_slots_free\":%lu,\"macro_slots_max\":%lu,"
+        "\"macro_storage_used\":%lu,\"macro_storage_free\":%lu,\"macro_storage_capacity\":%lu}",
         status.sta_connected ? "true" : "false",
         esc_ssid, status.sta_rssi, ip_str,
         status.ap_client_count, ap_ip_str,
@@ -177,7 +186,15 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         status.sta_scheduler_enabled ? "true" : "false",
         status.ap_enabled ? "true" : "false",
         status.sta_next_retry_s,
-        (unsigned long)free_heap, (unsigned long)uptime_sec);
+        (unsigned long)free_heap, (unsigned long)uptime_sec,
+        macro_stats.available ? "true" : "false",
+        (unsigned long)macro_stats.used_macros,
+        (unsigned long)(macro_stats.max_macros > macro_stats.used_macros
+                        ? macro_stats.max_macros - macro_stats.used_macros : 0),
+        (unsigned long)macro_stats.max_macros,
+        (unsigned long)macro_stats.used_bytes,
+        (unsigned long)macro_stats.free_bytes,
+        (unsigned long)macro_stats.total_bytes);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
@@ -283,6 +300,12 @@ static esp_err_t api_scan_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static bool json_is_object_like(const char *json);
+static bool json_get_string_strict(const char *json, const char *key,
+                                   char *out, size_t out_size, bool *present);
+static bool json_get_int_strict(const char *json, const char *key, int *out, bool *present);
+static bool runtime_string_valid_http(const char *value, size_t max_len);
+
 static esp_err_t api_config_get_handler(httpd_req_t *req)
 {
     if (!require_auth(req)) return ESP_OK;
@@ -374,6 +397,253 @@ static esp_err_t api_config_get_handler(httpd_req_t *req)
         IP2STR(&sdns1), IP2STR(&sdns2));
     httpd_resp_send_chunk(req, buf, len);
     httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+static bool runtime_get_u16_range(httpd_req_t *req, const char *json,
+                                  const char *key, uint16_t min, uint16_t max,
+                                  uint16_t *out, bool *changed)
+{
+    int ival;
+    bool present = false;
+    if (!json_get_int_strict(json, key, &ival, &present)) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Invalid %s", key);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+        return false;
+    }
+    if (!present) return true;
+    if (ival < (int)min || ival > (int)max) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%s out of range (%u-%u)", key, min, max);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+        return false;
+    }
+    *out = (uint16_t)ival;
+    if (changed) *changed = true;
+    return true;
+}
+
+static bool scheduler_get_u32_range(httpd_req_t *req, const char *json,
+                                    const char *key, uint32_t min, uint32_t max,
+                                    uint32_t *out, bool *changed)
+{
+    int ival;
+    bool present = false;
+    if (!json_get_int_strict(json, key, &ival, &present)) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Invalid %s", key);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+        return false;
+    }
+    if (!present) return true;
+    if (ival < (int)min || (uint32_t)ival > max) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%s out of range (%lu-%lu)", key,
+                 (unsigned long)min, (unsigned long)max);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+        return false;
+    }
+    *out = (uint32_t)ival;
+    if (changed) *changed = true;
+    return true;
+}
+
+static bool runtime_get_u8_range(httpd_req_t *req, const char *json,
+                                 const char *key, uint8_t min, uint8_t max,
+                                 uint8_t *out, bool *changed)
+{
+    uint16_t tmp = *out;
+    if (!runtime_get_u16_range(req, json, key, min, max, &tmp, changed)) {
+        return false;
+    }
+    *out = (uint8_t)tmp;
+    return true;
+}
+
+static esp_err_t api_runtime_config_get_handler(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+
+    char ntp1[CFG_NTP_SERVER_LEN * 2];
+    char ntp2[CFG_NTP_SERVER_LEN * 2];
+    json_escape(ntp1, sizeof(ntp1), s_config->ntp_server_1);
+    json_escape(ntp2, sizeof(ntp2), s_config->ntp_server_2);
+
+    char buf[1024];
+    snprintf(buf, sizeof(buf),
+        "{\"tailscale_boot_delay_s\":%u,"
+        "\"wifi_recovery_cooldown_s\":%u,"
+        "\"scheduler_poll_interval_s\":%u,"
+        "\"ntp_server_1\":\"%s\",\"ntp_server_2\":\"%s\","
+        "\"proxy_buf_size\":%u,"
+        "\"proxy_socket_timeout_s\":%u,"
+        "\"proxy_idle_timeout_s\":%u,"
+        "\"proxy_accept_retry_ms\":%u,"
+        "\"proxy_listen_backlog\":%u,"
+        "\"scan_active_min_ms\":%u,"
+        "\"scan_active_max_ms\":%u,"
+        "\"scan_timeout_s\":%u,"
+        "\"ping_count\":%u,"
+        "\"ping_interval_ms\":%u,"
+        "\"ping_timeout_ms\":%u,"
+        "\"ping_total_wait_s\":%u}",
+        s_config->tailscale_boot_delay_s,
+        s_config->wifi_recovery_cooldown_s,
+        s_config->scheduler_poll_interval_s,
+        ntp1, ntp2,
+        s_config->proxy_buf_size,
+        s_config->proxy_socket_timeout_s,
+        s_config->proxy_idle_timeout_s,
+        s_config->proxy_accept_retry_ms,
+        s_config->proxy_listen_backlog,
+        s_config->scan_active_min_ms,
+        s_config->scan_active_max_ms,
+        s_config->scan_timeout_s,
+        s_config->ping_count,
+        s_config->ping_interval_ms,
+        s_config->ping_timeout_ms,
+        s_config->ping_total_wait_s);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t api_runtime_config_post_handler(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+
+    char buf[1024];
+    if (req->content_len <= 0 || req->content_len >= (int)sizeof(buf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid payload size");
+        return ESP_FAIL;
+    }
+
+    int total = 0;
+    while (total < req->content_len) {
+        int received = httpd_req_recv(req, buf + total, req->content_len - total);
+        if (received <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Receive failed");
+            return ESP_FAIL;
+        }
+        total += received;
+    }
+    buf[total] = '\0';
+
+    if (!json_is_object_like(buf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    repeater_config_t next = *s_config;
+    bool changed = false;
+
+    if (!runtime_get_u16_range(req, buf, "tailscale_boot_delay_s",
+                               CFG_TS_BOOT_DELAY_MIN_S, CFG_TS_BOOT_DELAY_MAX_S,
+                               &next.tailscale_boot_delay_s, &changed)) return ESP_FAIL;
+    if (!runtime_get_u16_range(req, buf, "wifi_recovery_cooldown_s",
+                               CFG_WIFI_RECOVERY_COOLDOWN_MIN_S, CFG_WIFI_RECOVERY_COOLDOWN_MAX_S,
+                               &next.wifi_recovery_cooldown_s, &changed)) return ESP_FAIL;
+    if (!runtime_get_u16_range(req, buf, "scheduler_poll_interval_s",
+                               CFG_SCHED_POLL_INTERVAL_MIN_S, CFG_SCHED_POLL_INTERVAL_MAX_S,
+                               &next.scheduler_poll_interval_s, &changed)) return ESP_FAIL;
+
+    bool present = false;
+    char sval[CFG_NTP_SERVER_LEN];
+    if (!json_get_string_strict(buf, "ntp_server_1", sval, sizeof(sval), &present)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid ntp_server_1");
+        return ESP_FAIL;
+    }
+    if (present) {
+        if (!runtime_string_valid_http(sval, sizeof(next.ntp_server_1))) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "ntp_server_1 must be 1-63 printable non-space chars");
+            return ESP_FAIL;
+        }
+        strlcpy(next.ntp_server_1, sval, sizeof(next.ntp_server_1));
+        changed = true;
+    }
+    if (!json_get_string_strict(buf, "ntp_server_2", sval, sizeof(sval), &present)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid ntp_server_2");
+        return ESP_FAIL;
+    }
+    if (present) {
+        if (!runtime_string_valid_http(sval, sizeof(next.ntp_server_2))) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "ntp_server_2 must be 1-63 printable non-space chars");
+            return ESP_FAIL;
+        }
+        strlcpy(next.ntp_server_2, sval, sizeof(next.ntp_server_2));
+        changed = true;
+    }
+
+    if (!runtime_get_u16_range(req, buf, "proxy_buf_size",
+                               CFG_PROXY_BUF_SIZE_MIN, CFG_PROXY_BUF_SIZE_MAX,
+                               &next.proxy_buf_size, &changed)) return ESP_FAIL;
+    if (!runtime_get_u16_range(req, buf, "proxy_socket_timeout_s",
+                               CFG_PROXY_SOCKET_TIMEOUT_MIN_S, CFG_PROXY_SOCKET_TIMEOUT_MAX_S,
+                               &next.proxy_socket_timeout_s, &changed)) return ESP_FAIL;
+    if (!runtime_get_u16_range(req, buf, "proxy_idle_timeout_s",
+                               CFG_PROXY_IDLE_TIMEOUT_MIN_S, CFG_PROXY_IDLE_TIMEOUT_MAX_S,
+                               &next.proxy_idle_timeout_s, &changed)) return ESP_FAIL;
+    if (!runtime_get_u16_range(req, buf, "proxy_accept_retry_ms",
+                               CFG_PROXY_ACCEPT_RETRY_MIN_MS, CFG_PROXY_ACCEPT_RETRY_MAX_MS,
+                               &next.proxy_accept_retry_ms, &changed)) return ESP_FAIL;
+    if (!runtime_get_u8_range(req, buf, "proxy_listen_backlog",
+                              CFG_PROXY_LISTEN_BACKLOG_MIN, CFG_PROXY_LISTEN_BACKLOG_MAX,
+                              &next.proxy_listen_backlog, &changed)) return ESP_FAIL;
+    if (!runtime_get_u16_range(req, buf, "scan_active_min_ms",
+                               CFG_SCAN_ACTIVE_MIN_MIN_MS, CFG_SCAN_ACTIVE_MIN_MAX_MS,
+                               &next.scan_active_min_ms, &changed)) return ESP_FAIL;
+    if (!runtime_get_u16_range(req, buf, "scan_active_max_ms",
+                               CFG_SCAN_ACTIVE_MAX_MIN_MS, CFG_SCAN_ACTIVE_MAX_MAX_MS,
+                               &next.scan_active_max_ms, &changed)) return ESP_FAIL;
+    if (next.scan_active_max_ms < next.scan_active_min_ms) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "scan_active_max_ms must be >= scan_active_min_ms");
+        return ESP_FAIL;
+    }
+    if (!runtime_get_u16_range(req, buf, "scan_timeout_s",
+                               CFG_SCAN_TIMEOUT_MIN_S, CFG_SCAN_TIMEOUT_MAX_S,
+                               &next.scan_timeout_s, &changed)) return ESP_FAIL;
+    if (!runtime_get_u8_range(req, buf, "ping_count",
+                              CFG_PING_COUNT_MIN, CFG_PING_COUNT_MAX,
+                              &next.ping_count, &changed)) return ESP_FAIL;
+    if (!runtime_get_u16_range(req, buf, "ping_interval_ms",
+                               CFG_PING_INTERVAL_MIN_MS, CFG_PING_INTERVAL_MAX_MS,
+                               &next.ping_interval_ms, &changed)) return ESP_FAIL;
+    if (!runtime_get_u16_range(req, buf, "ping_timeout_ms",
+                               CFG_PING_TIMEOUT_MIN_MS, CFG_PING_TIMEOUT_MAX_MS,
+                               &next.ping_timeout_ms, &changed)) return ESP_FAIL;
+    if (!runtime_get_u16_range(req, buf, "ping_total_wait_s",
+                               CFG_PING_TOTAL_WAIT_MIN_S, CFG_PING_TOTAL_WAIT_MAX_S,
+                               &next.ping_total_wait_s, &changed)) return ESP_FAIL;
+
+    if (!changed) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No runtime tuning fields");
+        return ESP_FAIL;
+    }
+
+    *s_config = next;
+    esp_err_t ret = config_storage_save(s_config);
+    if (ret != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Runtime config save failed");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Runtime tuning saved: ts_boot=%us wifi_rec=%us sched_poll=%us proxy_buf=%u",
+             s_config->tailscale_boot_delay_s,
+             s_config->wifi_recovery_cooldown_s,
+             s_config->scheduler_poll_interval_s,
+             s_config->proxy_buf_size);
+
+    tailscale_manager_apply_runtime_config(s_config);
+    scheduler_manager_apply_config(s_config);
+    wifi_manager_apply_port_forwarding();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Runtime tuning saved\",\"requires_reboot\":false}");
     return ESP_OK;
 }
 
@@ -668,6 +938,17 @@ static bool scheduler_tz_valid_http(const char *value)
     return true;
 }
 
+static bool runtime_string_valid_http(const char *value, size_t max_len)
+{
+    size_t len = strlen(value);
+    if (len == 0 || len >= max_len) return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (c < 0x21 || c > 0x7e) return false;
+    }
+    return true;
+}
+
 static bool scheduler_note_valid(const char *value)
 {
     for (size_t i = 0; value[i] != '\0'; i++) {
@@ -692,6 +973,7 @@ static bool scheduler_macro_id_valid_http(uint32_t macro_id)
     usb_hid_macro_t *macro = calloc(1, sizeof(*macro));
     if (!macro) return false;
     esp_err_t ret = usb_hid_macro_store_get(macro_id, macro);
+    usb_hid_macro_free(macro);
     free(macro);
     return ret == ESP_OK;
 }
@@ -1045,13 +1327,17 @@ static esp_err_t api_scheduler_status_handler(httpd_req_t *req)
     json_escape(esc_next, sizeof(esc_next), status.next_change_local);
     json_escape(esc_reason, sizeof(esc_reason), status.reason);
 
-    char buf[896];
+    char buf[1152];
     snprintf(buf, sizeof(buf),
         "{\"time_valid\":%s,\"ntp_synced\":%s,\"timezone\":\"%s\","
         "\"local_time\":\"%s\",\"mode\":%u,\"ap_effective\":%s,"
         "\"ap_desired\":%s,\"sta_effective\":%s,\"sta_desired\":%s,"
         "\"tailscale_effective\":%s,\"tailscale_desired\":%s,"
-        "\"safety_hold\":%s,\"active_rule\":%d,"
+        "\"safety_hold\":%s,\"dormant_active\":%s,"
+        "\"dormant_time_sync_active\":%s,\"dormant_next_retry_s\":%lu,"
+        "\"dormant_ap_recovery_active\":%s,"
+        "\"dormant_ap_recovery_remaining_s\":%lu,"
+        "\"dormant_reason\":\"%s\",\"active_rule\":%d,"
         "\"next_rule\":%d,\"next_change_s\":%lu,"
         "\"next_change_local\":\"%s\",\"reason\":\"%s\"}",
         status.time_valid ? "true" : "false",
@@ -1064,6 +1350,12 @@ static esp_err_t api_scheduler_status_handler(httpd_req_t *req)
         status.tailscale_effective ? "true" : "false",
         status.tailscale_desired ? "true" : "false",
         status.safety_hold ? "true" : "false",
+        status.dormant_active ? "true" : "false",
+        status.dormant_time_sync_active ? "true" : "false",
+        (unsigned long)status.dormant_next_retry_s,
+        status.dormant_ap_recovery_active ? "true" : "false",
+        (unsigned long)status.dormant_ap_recovery_remaining_s,
+        status.dormant_reason,
         status.active_rule, status.next_rule,
         (unsigned long)status.next_change_s,
         esc_next, esc_reason);
@@ -1081,10 +1373,25 @@ static esp_err_t api_scheduler_config_get_handler(httpd_req_t *req)
     json_escape(esc_tz, sizeof(esc_tz), s_config->sched_tz);
 
     httpd_resp_set_type(req, "application/json");
-    char buf[384];
+    char buf[512];
     int len = snprintf(buf, sizeof(buf),
-        "{\"timezone\":\"%s\",\"mode\":%u,\"rules\":[",
-        esc_tz, (unsigned)s_config->sched_mode);
+        "{\"timezone\":\"%s\",\"mode\":%u,"
+        "\"dormant_time_sync_attempt_s\":%u,"
+        "\"dormant_time_sync_retry_s\":%lu,"
+        "\"dormant_ap_recovery_enabled\":%s,"
+        "\"dormant_ap_recovery_window_s\":%u,"
+        "\"dormant_button_wake_enabled\":%s,"
+        "\"dormant_button_wake_s\":%u,"
+        "\"dormant_keep_ap_off_during_active_window\":%s,"
+        "\"rules\":[",
+        esc_tz, (unsigned)s_config->sched_mode,
+        s_config->dormant_time_sync_attempt_s,
+        (unsigned long)s_config->dormant_time_sync_retry_s,
+        s_config->dormant_ap_recovery_enabled ? "true" : "false",
+        s_config->dormant_ap_recovery_window_s,
+        s_config->dormant_button_wake_enabled ? "true" : "false",
+        s_config->dormant_button_wake_s,
+        s_config->dormant_keep_ap_off_during_active_window ? "true" : "false");
     httpd_resp_send_chunk(req, buf, len);
 
     for (int i = 0; i < CFG_SCHED_RULES_MAX; i++) {
@@ -1131,6 +1438,14 @@ static esp_err_t api_scheduler_config_post_handler(httpd_req_t *req)
     scheduler_mode_t new_mode = s_config->sched_mode;
     char new_tz[CFG_SCHED_TZ_LEN];
     scheduler_rule_t new_rules[CFG_SCHED_RULES_MAX];
+    uint16_t new_dormant_time_sync_attempt_s = s_config->dormant_time_sync_attempt_s;
+    uint32_t new_dormant_time_sync_retry_s = s_config->dormant_time_sync_retry_s;
+    bool new_dormant_ap_recovery_enabled = s_config->dormant_ap_recovery_enabled;
+    uint16_t new_dormant_ap_recovery_window_s = s_config->dormant_ap_recovery_window_s;
+    bool new_dormant_button_wake_enabled = s_config->dormant_button_wake_enabled;
+    uint16_t new_dormant_button_wake_s = s_config->dormant_button_wake_s;
+    bool new_dormant_keep_ap_off_during_active_window =
+        s_config->dormant_keep_ap_off_during_active_window;
     strlcpy(new_tz, s_config->sched_tz, sizeof(new_tz));
     memcpy(new_rules, s_config->sched_rules, sizeof(new_rules));
 
@@ -1151,12 +1466,51 @@ static esp_err_t api_scheduler_config_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     if (present) {
-        if (ival < SCHED_MODE_ALWAYS_ON || ival > SCHED_MODE_MANUAL_OFF) {
+        if (ival < SCHED_MODE_ALWAYS_ON || ival > SCHED_MODE_DORMANT_SCHEDULED) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode out of range");
             return ESP_FAIL;
         }
         new_mode = (scheduler_mode_t)ival;
     }
+
+    bool changed = false;
+    if (!runtime_get_u16_range(req, buf, "dormant_time_sync_attempt_s",
+                               CFG_DORMANT_TIME_SYNC_ATTEMPT_MIN_S,
+                               CFG_DORMANT_TIME_SYNC_ATTEMPT_MAX_S,
+                               &new_dormant_time_sync_attempt_s,
+                               &changed)) return ESP_FAIL;
+    if (!scheduler_get_u32_range(req, buf, "dormant_time_sync_retry_s",
+                                 CFG_DORMANT_TIME_SYNC_RETRY_MIN_S,
+                                 CFG_DORMANT_TIME_SYNC_RETRY_MAX_S,
+                                 &new_dormant_time_sync_retry_s,
+                                 &changed)) return ESP_FAIL;
+    if (!json_get_bool_strict(buf, "dormant_ap_recovery_enabled", &bval, &present)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid dormant_ap_recovery_enabled");
+        return ESP_FAIL;
+    }
+    if (present) new_dormant_ap_recovery_enabled = bval;
+    if (!runtime_get_u16_range(req, buf, "dormant_ap_recovery_window_s",
+                               CFG_DORMANT_AP_RECOVERY_WINDOW_MIN_S,
+                               CFG_DORMANT_AP_RECOVERY_WINDOW_MAX_S,
+                               &new_dormant_ap_recovery_window_s,
+                               &changed)) return ESP_FAIL;
+    if (!json_get_bool_strict(buf, "dormant_button_wake_enabled", &bval, &present)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid dormant_button_wake_enabled");
+        return ESP_FAIL;
+    }
+    if (present) new_dormant_button_wake_enabled = bval;
+    if (!runtime_get_u16_range(req, buf, "dormant_button_wake_s",
+                               CFG_DORMANT_BUTTON_WAKE_MIN_S,
+                               CFG_DORMANT_BUTTON_WAKE_MAX_S,
+                               &new_dormant_button_wake_s,
+                               &changed)) return ESP_FAIL;
+    if (!json_get_bool_strict(buf, "dormant_keep_ap_off_during_active_window",
+                              &bval, &present)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Invalid dormant_keep_ap_off_during_active_window");
+        return ESP_FAIL;
+    }
+    if (present) new_dormant_keep_ap_off_during_active_window = bval;
 
     for (int i = 0; i < CFG_SCHED_RULES_MAX; i++) {
         char key[24];
@@ -1274,10 +1628,25 @@ static esp_err_t api_scheduler_config_post_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
     }
+    if (new_mode == SCHED_MODE_DORMANT_SCHEDULED &&
+        !new_dormant_button_wake_enabled &&
+        !new_dormant_ap_recovery_enabled) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Dormant Scheduled requires AP recovery or BOOT button wake");
+        return ESP_FAIL;
+    }
 
     strlcpy(s_config->sched_tz, new_tz, sizeof(s_config->sched_tz));
     s_config->sched_mode = new_mode;
     memcpy(s_config->sched_rules, new_rules, sizeof(s_config->sched_rules));
+    s_config->dormant_time_sync_attempt_s = new_dormant_time_sync_attempt_s;
+    s_config->dormant_time_sync_retry_s = new_dormant_time_sync_retry_s;
+    s_config->dormant_ap_recovery_enabled = new_dormant_ap_recovery_enabled;
+    s_config->dormant_ap_recovery_window_s = new_dormant_ap_recovery_window_s;
+    s_config->dormant_button_wake_enabled = new_dormant_button_wake_enabled;
+    s_config->dormant_button_wake_s = new_dormant_button_wake_s;
+    s_config->dormant_keep_ap_off_during_active_window =
+        new_dormant_keep_ap_off_during_active_window;
 
     esp_err_t save_ret = config_storage_save(s_config);
     if (save_ret != ESP_OK) {
@@ -1539,18 +1908,23 @@ static esp_err_t api_tailscale_config_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    /* Send HTTP response BEFORE applying config — tailscale_manager may
-     * call esp_restart() if MicroLink is already running, which would
-     * kill the HTTP connection before the client sees the OK. */
+    bool tailscale_configured = s_config->tailscale.auth_key[0] != '\0';
+    bool reboot_to_apply = s_config->tailscale.enabled && tailscale_configured;
+
+    /* Send HTTP response before reboot/apply so the browser receives a
+     * deterministic result even when WiFi/Tailscale transport drops. */
     httpd_resp_set_type(req, "application/json");
-    if (old_net_mode != s_config->tailscale.net_mode) {
-        httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Network mode changed. Rebooting to apply NAT mode...\"}");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    if (reboot_to_apply) {
+        ESP_LOGI(TAG, "Tailscale config saved; rebooting to apply (net_mode_changed=%d)",
+                 old_net_mode != s_config->tailscale.net_mode ? 1 : 0);
+        httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Tailscale config saved. Rebooting to apply...\",\"rebooting\":true}");
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();
         return ESP_OK;
     }
 
-    httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Tailscale config saved\"}");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Tailscale config saved\",\"rebooting\":false}");
 
     tailscale_manager_apply_config(s_config);
     return ESP_OK;
@@ -1597,8 +1971,10 @@ static char *read_request_body(httpd_req_t *req, size_t max_len)
         return NULL;
     }
 
-    char *buf = calloc(1, req->content_len + 1);
+    char *buf = heap_caps_malloc(req->content_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = malloc(req->content_len + 1);
     if (!buf) return NULL;
+    memset(buf, 0, req->content_len + 1);
 
     int total = 0;
     while (total < req->content_len) {
@@ -1613,21 +1989,45 @@ static char *read_request_body(httpd_req_t *req, size_t max_len)
     return buf;
 }
 
-#define USB_HID_JSON_BODY_MAX (USB_HID_MACRO_SCRIPT_LEN * 2 + USB_HID_MACRO_NAME_LEN + 256)
+#define USB_HID_JSON_BODY_MAX (USB_HID_MACRO_SCRIPT_MAX_BYTES * 2 + 4096)
 
 static bool usb_hid_id_from_uri(const char *uri, uint32_t *id);
 
-static void usb_hid_send_macro_json(httpd_req_t *req, const usb_hid_macro_t *macro)
+static void usb_hid_add_storage_json(cJSON *root, const usb_hid_macro_storage_stats_t *stats)
 {
+    cJSON *storage = cJSON_AddObjectToObject(root, "storage");
+    if (!storage) return;
+    cJSON_AddBoolToObject(storage, "available", stats->available);
+    cJSON_AddNumberToObject(storage, "total", stats->total_bytes);
+    cJSON_AddNumberToObject(storage, "used", stats->used_bytes);
+    cJSON_AddNumberToObject(storage, "free", stats->free_bytes);
+    cJSON_AddNumberToObject(storage, "max_macros", stats->max_macros);
+    cJSON_AddNumberToObject(storage, "used_macros", stats->used_macros);
+    cJSON_AddNumberToObject(storage, "max_payload_bytes", USB_HID_MACRO_SCRIPT_MAX_BYTES);
+}
+
+static void usb_hid_add_macro_metadata_json(cJSON *item, const usb_hid_macro_t *macro)
+{
+    cJSON_AddNumberToObject(item, "id", macro->id);
+    cJSON_AddStringToObject(item, "name", macro->name);
+    cJSON_AddStringToObject(item, "layout", macro->layout[0] ? macro->layout : USB_HID_MACRO_DEFAULT_LAYOUT);
+    cJSON_AddNumberToObject(item, "script_len", macro->script_len);
+}
+
+static void usb_hid_send_storage_json(httpd_req_t *req)
+{
+    usb_hid_macro_storage_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    if (usb_hid_macro_store_stats(&stats) != ESP_OK) {
+        stats.max_macros = USB_HID_MACRO_MAX_METADATA;
+    }
+
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json allocation failed");
         return;
     }
-    cJSON_AddNumberToObject(root, "id", macro->id);
-    cJSON_AddStringToObject(root, "name", macro->name);
-    cJSON_AddStringToObject(root, "layout", macro->layout[0] ? macro->layout : USB_HID_MACRO_DEFAULT_LAYOUT);
-    cJSON_AddStringToObject(root, "script", macro->script);
+    usb_hid_add_storage_json(root, &stats);
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
 
@@ -1640,18 +2040,56 @@ static void usb_hid_send_macro_json(httpd_req_t *req, const usb_hid_macro_t *mac
     }
 }
 
+static void usb_hid_send_macro_json(httpd_req_t *req, const usb_hid_macro_t *macro, bool include_script)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json allocation failed");
+        return;
+    }
+    usb_hid_add_macro_metadata_json(root, macro);
+    if (include_script) cJSON_AddStringToObject(root, "script", macro->script ? macro->script : "");
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+    if (json) {
+        httpd_resp_sendstr(req, json);
+        free(json);
+    } else {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json allocation failed");
+    }
+}
+
+static void usb_hid_send_storage_full_error(httpd_req_t *req, const char *message)
+{
+    httpd_resp_set_status(req, "507 Insufficient Storage");
+    httpd_resp_sendstr(req, message);
+}
+
+static void usb_hid_send_storage_unavailable(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_sendstr(req, "macro storage unavailable");
+}
+
 static esp_err_t api_usb_hid_macros_list_handler(httpd_req_t *req)
 {
     if (!require_auth(req)) return ESP_OK;
 
-    usb_hid_macro_t *macros = calloc(USB_HID_MACRO_MAX, sizeof(usb_hid_macro_t));
+    usb_hid_macro_t *macros = calloc(USB_HID_MACRO_MAX_METADATA, sizeof(usb_hid_macro_t));
     if (!macros) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "allocation failed");
         return ESP_FAIL;
     }
 
     size_t count = 0;
-    esp_err_t ret = usb_hid_macro_store_list(macros, USB_HID_MACRO_MAX, &count);
+    esp_err_t ret = usb_hid_macro_store_list(macros, USB_HID_MACRO_MAX_METADATA, &count);
+    if (ret == ESP_ERR_INVALID_STATE) {
+        free(macros);
+        usb_hid_send_storage_unavailable(req);
+        return ESP_FAIL;
+    }
     if (ret != ESP_OK) {
         free(macros);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "macro list failed");
@@ -1679,12 +2117,15 @@ static esp_err_t api_usb_hid_macros_list_handler(httpd_req_t *req)
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json allocation failed");
             return ESP_FAIL;
         }
-        cJSON_AddNumberToObject(item, "id", macros[i].id);
-        cJSON_AddStringToObject(item, "name", macros[i].name);
-        cJSON_AddStringToObject(item, "layout", macros[i].layout[0] ? macros[i].layout : USB_HID_MACRO_DEFAULT_LAYOUT);
-        cJSON_AddStringToObject(item, "script", macros[i].script);
+        usb_hid_add_macro_metadata_json(item, &macros[i]);
         cJSON_AddItemToArray(items, item);
     }
+    usb_hid_macro_storage_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    if (usb_hid_macro_store_stats(&stats) != ESP_OK) {
+        stats.max_macros = USB_HID_MACRO_MAX_METADATA;
+    }
+    usb_hid_add_storage_json(root, &stats);
     free(macros);
 
     char *json = cJSON_PrintUnformatted(root);
@@ -1703,6 +2144,11 @@ static esp_err_t api_usb_hid_macros_save_handler(httpd_req_t *req)
 {
     if (!require_auth(req)) return ESP_OK;
 
+    if (req->content_len > USB_HID_JSON_BODY_MAX) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_sendstr(req, "macro payload exceeds configured 512 KiB script limit");
+        return ESP_FAIL;
+    }
     char *body = read_request_body(req, USB_HID_JSON_BODY_MAX);
     if (!body) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid macro payload");
@@ -1720,14 +2166,14 @@ static esp_err_t api_usb_hid_macros_save_handler(httpd_req_t *req)
     cJSON *name = cJSON_GetObjectItem(root, "name");
     cJSON *layout = cJSON_GetObjectItem(root, "layout");
     cJSON *script = cJSON_GetObjectItem(root, "script");
-    if (!cJSON_IsString(name) || !cJSON_IsString(script)) {
+    if (!cJSON_IsString(name)) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "name and script are required");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "name is required");
         return ESP_FAIL;
     }
-    if (strlen(script->valuestring) >= USB_HID_MACRO_SCRIPT_LEN) {
+    if (script && !cJSON_IsString(script)) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "script is too long");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "script must be a string");
         return ESP_FAIL;
     }
 
@@ -1748,29 +2194,78 @@ static esp_err_t api_usb_hid_macros_save_handler(httpd_req_t *req)
     strlcpy(macro->name, name->valuestring, sizeof(macro->name));
     strlcpy(macro->layout, cJSON_IsString(layout) ? layout->valuestring : USB_HID_MACRO_DEFAULT_LAYOUT,
             sizeof(macro->layout));
-    strlcpy(macro->script, script->valuestring, sizeof(macro->script));
-    cJSON_Delete(root);
+    if (cJSON_IsString(script)) {
+        macro->script = script->valuestring;
+        macro->script_len = strlen(script->valuestring);
+        if (macro->script_len > USB_HID_MACRO_SCRIPT_MAX_BYTES) {
+            cJSON_Delete(root);
+            free(macro);
+            httpd_resp_set_status(req, "413 Payload Too Large");
+            httpd_resp_sendstr(req, "script exceeds configured 512 KiB limit");
+            return ESP_FAIL;
+        }
+    } else if (macro->id != 0 && req->method == HTTP_PUT) {
+        usb_hid_macro_t existing;
+        memset(&existing, 0, sizeof(existing));
+        esp_err_t get_ret = usb_hid_macro_store_get(macro->id, &existing);
+        if (get_ret != ESP_OK) {
+            cJSON_Delete(root);
+            free(macro);
+            httpd_resp_send_err(req, get_ret == ESP_ERR_NOT_FOUND ? HTTPD_404_NOT_FOUND : HTTPD_500_INTERNAL_SERVER_ERROR,
+                                get_ret == ESP_ERR_NOT_FOUND ? "macro not found" : "macro get failed");
+            return ESP_FAIL;
+        }
+        macro->script = existing.script;
+        macro->script_len = existing.script_len;
+    } else {
+        cJSON_Delete(root);
+        free(macro);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "script is required");
+        return ESP_FAIL;
+    }
 
     uint32_t saved_id = 0;
     esp_err_t ret = usb_hid_macro_store_save(macro, &saved_id);
     if (ret == ESP_ERR_INVALID_ARG) {
+        if (macro->script != (script && cJSON_IsString(script) ? script->valuestring : NULL)) usb_hid_macro_free(macro);
+        cJSON_Delete(root);
         free(macro);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid macro");
         return ESP_FAIL;
     }
     if (ret == ESP_ERR_NO_MEM) {
+        if (macro->script != (script && cJSON_IsString(script) ? script->valuestring : NULL)) usb_hid_macro_free(macro);
+        cJSON_Delete(root);
         free(macro);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "macro storage full");
+        usb_hid_send_storage_full_error(req, "macro storage full");
+        return ESP_FAIL;
+    }
+    if (ret == ESP_ERR_NOT_FOUND) {
+        if (macro->script != (script && cJSON_IsString(script) ? script->valuestring : NULL)) usb_hid_macro_free(macro);
+        cJSON_Delete(root);
+        free(macro);
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "macro not found");
+        return ESP_FAIL;
+    }
+    if (ret == ESP_ERR_INVALID_STATE) {
+        if (macro->script != (script && cJSON_IsString(script) ? script->valuestring : NULL)) usb_hid_macro_free(macro);
+        cJSON_Delete(root);
+        free(macro);
+        usb_hid_send_storage_unavailable(req);
         return ESP_FAIL;
     }
     if (ret != ESP_OK) {
+        if (macro->script != (script && cJSON_IsString(script) ? script->valuestring : NULL)) usb_hid_macro_free(macro);
+        cJSON_Delete(root);
         free(macro);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "macro save failed");
         return ESP_FAIL;
     }
 
     macro->id = saved_id;
-    usb_hid_send_macro_json(req, macro);
+    usb_hid_send_macro_json(req, macro, false);
+    if (macro->script != (script && cJSON_IsString(script) ? script->valuestring : NULL)) usb_hid_macro_free(macro);
+    cJSON_Delete(root);
     free(macro);
     return ESP_OK;
 }
@@ -1809,13 +2304,19 @@ static esp_err_t api_usb_hid_macro_get_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "macro not found");
         return ESP_FAIL;
     }
+    if (ret == ESP_ERR_INVALID_STATE) {
+        free(macro);
+        usb_hid_send_storage_unavailable(req);
+        return ESP_FAIL;
+    }
     if (ret != ESP_OK) {
         free(macro);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "macro get failed");
         return ESP_FAIL;
     }
 
-    usb_hid_send_macro_json(req, macro);
+    usb_hid_send_macro_json(req, macro, true);
+    usb_hid_macro_free(macro);
     free(macro);
     return ESP_OK;
 }
@@ -1834,6 +2335,10 @@ static esp_err_t api_usb_hid_macro_delete_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "macro not found");
         return ESP_FAIL;
     }
+    if (ret == ESP_ERR_INVALID_STATE) {
+        usb_hid_send_storage_unavailable(req);
+        return ESP_FAIL;
+    }
     if (ret != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "macro delete failed");
         return ESP_FAIL;
@@ -1844,10 +2349,22 @@ static esp_err_t api_usb_hid_macro_delete_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t api_usb_hid_storage_handler(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    usb_hid_send_storage_json(req);
+    return ESP_OK;
+}
+
 static esp_err_t api_usb_hid_validate_handler(httpd_req_t *req)
 {
     if (!require_auth(req)) return ESP_OK;
 
+    if (req->content_len > USB_HID_JSON_BODY_MAX) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_sendstr(req, "validation payload exceeds configured 512 KiB script limit");
+        return ESP_FAIL;
+    }
     char *body = read_request_body(req, USB_HID_JSON_BODY_MAX);
     if (!body) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid validation payload");
@@ -1896,6 +2413,11 @@ static esp_err_t api_usb_hid_execute_handler(httpd_req_t *req)
 {
     if (!require_auth(req)) return ESP_OK;
 
+    if (req->content_len > USB_HID_JSON_BODY_MAX) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_sendstr(req, "execute payload exceeds configured 512 KiB script limit");
+        return ESP_FAIL;
+    }
     char *body = read_request_body(req, USB_HID_JSON_BODY_MAX);
     if (!body) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid execute payload");
@@ -1917,9 +2439,11 @@ static esp_err_t api_usb_hid_execute_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "script is required");
         return ESP_FAIL;
     }
-    if (strlen(script->valuestring) >= USB_HID_MACRO_SCRIPT_LEN) {
+    size_t script_len = strlen(script->valuestring);
+    if (script_len > USB_HID_MACRO_SCRIPT_MAX_BYTES) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "script is too long");
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_sendstr(req, "script exceeds configured 512 KiB limit");
         return ESP_FAIL;
     }
 
@@ -1932,19 +2456,21 @@ static esp_err_t api_usb_hid_execute_handler(httpd_req_t *req)
     strlcpy(macro->name, cJSON_IsString(name) ? name->valuestring : "Unsaved Macro", sizeof(macro->name));
     strlcpy(macro->layout, cJSON_IsString(layout) ? layout->valuestring : USB_HID_MACRO_DEFAULT_LAYOUT,
             sizeof(macro->layout));
-    strlcpy(macro->script, script->valuestring, sizeof(macro->script));
-    cJSON_Delete(root);
+    macro->script = script->valuestring;
+    macro->script_len = script_len;
 
     usb_hid_parse_result_t parsed = usb_hid_macro_validate(macro->script);
     if (!parsed.ok) {
         char msg[128];
-        snprintf(msg, sizeof(msg), "line %u: %s", parsed.line, parsed.message);
+        snprintf(msg, sizeof(msg), "line %" PRIu32 ": %s", parsed.line, parsed.message);
+        cJSON_Delete(root);
         free(macro);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
         return ESP_FAIL;
     }
 
     esp_err_t ret = usb_hid_executor_start(macro);
+    cJSON_Delete(root);
     free(macro);
     if (ret == ESP_ERR_INVALID_STATE) {
         httpd_resp_set_status(req, "409 Conflict");
@@ -2402,12 +2928,15 @@ esp_err_t web_server_start(repeater_config_t *config)
     httpd_uri_t uri_scan     = { .uri = "/api/scan",    .method = HTTP_GET,  .handler = api_scan_handler };
     httpd_uri_t uri_cfg_get  = { .uri = "/api/config",  .method = HTTP_GET,  .handler = api_config_get_handler };
     httpd_uri_t uri_cfg_post = { .uri = "/api/config",  .method = HTTP_POST, .handler = api_config_post_handler };
+    httpd_uri_t uri_runtime_cfg_get = { .uri = "/api/runtime/config", .method = HTTP_GET, .handler = api_runtime_config_get_handler };
+    httpd_uri_t uri_runtime_cfg_post = { .uri = "/api/runtime/config", .method = HTTP_POST, .handler = api_runtime_config_post_handler };
     httpd_uri_t uri_ts_status = { .uri = "/api/tailscale/status", .method = HTTP_GET,  .handler = api_tailscale_status_handler };
     httpd_uri_t uri_ts_cfg_get = { .uri = "/api/tailscale/config", .method = HTTP_GET,  .handler = api_tailscale_config_get_handler };
     httpd_uri_t uri_ts_cfg_post = { .uri = "/api/tailscale/config", .method = HTTP_POST, .handler = api_tailscale_config_post_handler };
     httpd_uri_t uri_clients  = { .uri = "/api/clients", .method = HTTP_GET,  .handler = api_clients_handler };
     httpd_uri_t uri_usb_hid_macros_get = { .uri = "/api/usb-hid/macros", .method = HTTP_GET, .handler = api_usb_hid_macros_list_handler };
     httpd_uri_t uri_usb_hid_macros_post = { .uri = "/api/usb-hid/macros", .method = HTTP_POST, .handler = api_usb_hid_macros_save_handler };
+    httpd_uri_t uri_usb_hid_storage = { .uri = "/api/usb-hid/storage", .method = HTTP_GET, .handler = api_usb_hid_storage_handler };
     httpd_uri_t uri_usb_hid_macro_get = { .uri = "/api/usb-hid/macros/*", .method = HTTP_GET, .handler = api_usb_hid_macro_get_handler };
     httpd_uri_t uri_usb_hid_macro_put = { .uri = "/api/usb-hid/macros/*", .method = HTTP_PUT, .handler = api_usb_hid_macros_save_handler };
     httpd_uri_t uri_usb_hid_macro_delete = { .uri = "/api/usb-hid/macros/*", .method = HTTP_DELETE, .handler = api_usb_hid_macro_delete_handler };
@@ -2443,12 +2972,15 @@ esp_err_t web_server_start(repeater_config_t *config)
     httpd_register_uri_handler(s_server, &uri_scan);
     httpd_register_uri_handler(s_server, &uri_cfg_get);
     httpd_register_uri_handler(s_server, &uri_cfg_post);
+    httpd_register_uri_handler(s_server, &uri_runtime_cfg_get);
+    httpd_register_uri_handler(s_server, &uri_runtime_cfg_post);
     httpd_register_uri_handler(s_server, &uri_ts_status);
     httpd_register_uri_handler(s_server, &uri_ts_cfg_get);
     httpd_register_uri_handler(s_server, &uri_ts_cfg_post);
     httpd_register_uri_handler(s_server, &uri_clients);
     httpd_register_uri_handler(s_server, &uri_usb_hid_macros_get);
     httpd_register_uri_handler(s_server, &uri_usb_hid_macros_post);
+    httpd_register_uri_handler(s_server, &uri_usb_hid_storage);
     httpd_register_uri_handler(s_server, &uri_usb_hid_macro_get);
     httpd_register_uri_handler(s_server, &uri_usb_hid_macro_put);
     httpd_register_uri_handler(s_server, &uri_usb_hid_macro_delete);

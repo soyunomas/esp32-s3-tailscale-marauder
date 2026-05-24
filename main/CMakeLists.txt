@@ -16,5 +16,6 @@ idf_component_register(
         esp_driver_gpio
         espressif__cjson
         esp_tinyusb
+        spiffs
     EMBED_FILES "embedded_files/index.html" "embedded_files/styles.css" "embedded_files/app.js" "embedded_files/usb_hid.js"
 )

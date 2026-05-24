@@ -35,6 +35,17 @@ static bool scheduler_tz_valid(const char *value)
     return true;
 }
 
+static bool runtime_string_valid(const char *value, size_t max_len)
+{
+    size_t len = strlen(value);
+    if (len == 0 || len >= max_len) return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (c < 0x21 || c > 0x7e) return false;
+    }
+    return true;
+}
+
 static bool scheduler_rule_valid(const scheduler_rule_t *rule)
 {
     if (!rule->enabled) return true;
@@ -97,6 +108,23 @@ void config_storage_set_defaults(repeater_config_t *config)
      * available for Tailscale handshake/transfer. */
     config->log_level_global = CFG_LOG_LEVEL_INFO;
     config->log_level_microlink = CFG_LOG_LEVEL_WARN;
+    config->tailscale_boot_delay_s = CFG_TS_BOOT_DELAY_DEFAULT_S;
+    config->wifi_recovery_cooldown_s = CFG_WIFI_RECOVERY_COOLDOWN_DEFAULT_S;
+    config->scheduler_poll_interval_s = CFG_SCHED_POLL_INTERVAL_DEFAULT_S;
+    strlcpy(config->ntp_server_1, CFG_NTP_SERVER_1_DEFAULT, sizeof(config->ntp_server_1));
+    strlcpy(config->ntp_server_2, CFG_NTP_SERVER_2_DEFAULT, sizeof(config->ntp_server_2));
+    config->proxy_buf_size = CFG_PROXY_BUF_SIZE_DEFAULT;
+    config->proxy_socket_timeout_s = CFG_PROXY_SOCKET_TIMEOUT_DEFAULT_S;
+    config->proxy_idle_timeout_s = CFG_PROXY_IDLE_TIMEOUT_DEFAULT_S;
+    config->proxy_accept_retry_ms = CFG_PROXY_ACCEPT_RETRY_DEFAULT_MS;
+    config->proxy_listen_backlog = CFG_PROXY_LISTEN_BACKLOG_DEFAULT;
+    config->scan_active_min_ms = CFG_SCAN_ACTIVE_MIN_DEFAULT_MS;
+    config->scan_active_max_ms = CFG_SCAN_ACTIVE_MAX_DEFAULT_MS;
+    config->scan_timeout_s = CFG_SCAN_TIMEOUT_DEFAULT_S;
+    config->ping_count = CFG_PING_COUNT_DEFAULT;
+    config->ping_interval_ms = CFG_PING_INTERVAL_DEFAULT_MS;
+    config->ping_timeout_ms = CFG_PING_TIMEOUT_DEFAULT_MS;
+    config->ping_total_wait_s = CFG_PING_TOTAL_WAIT_DEFAULT_S;
     strlcpy(config->sched_tz, CFG_SCHED_TZ_DEFAULT, sizeof(config->sched_tz));
     config->sched_mode = SCHED_MODE_ALWAYS_ON;
     for (int i = 0; i < CFG_SCHED_RULES_MAX; i++) {
@@ -104,6 +132,13 @@ void config_storage_set_defaults(repeater_config_t *config)
         config->sched_rules[i].sta_enabled = true;
         config->sched_rules[i].tailscale_enabled = true;
     }
+    config->dormant_time_sync_attempt_s = CFG_DORMANT_TIME_SYNC_ATTEMPT_DEFAULT_S;
+    config->dormant_time_sync_retry_s = CFG_DORMANT_TIME_SYNC_RETRY_DEFAULT_S;
+    config->dormant_ap_recovery_enabled = false;
+    config->dormant_ap_recovery_window_s = CFG_DORMANT_AP_RECOVERY_WINDOW_DEFAULT_S;
+    config->dormant_button_wake_enabled = true;
+    config->dormant_button_wake_s = CFG_DORMANT_BUTTON_WAKE_DEFAULT_S;
+    config->dormant_keep_ap_off_during_active_window = true;
     config->usb_hid_keepalive_enabled = false;
     config->usb_hid_keepalive_interval_s = CFG_USB_HID_KEEPALIVE_INTERVAL_DEFAULT_S;
     strlcpy(config->usb_hid_keepalive_key, CFG_USB_HID_KEEPALIVE_KEY_DEFAULT,
@@ -146,6 +181,7 @@ esp_err_t config_storage_load(repeater_config_t *config)
     nvs_get_str(handle, "ap_pass", config->ap_pass, &len);
 
     uint8_t val;
+    uint32_t val32;
     if (nvs_get_u8(handle, "ap_channel", &val) == ESP_OK) config->ap_channel = val;
     if (nvs_get_u8(handle, "ap_max_conn", &val) == ESP_OK) config->ap_max_conn = val;
     if (nvs_get_u8(handle, "ap_hidden", &val) == ESP_OK) config->ap_hide_ssid = val != 0;
@@ -234,10 +270,50 @@ esp_err_t config_storage_load(repeater_config_t *config)
 
     if (nvs_get_u8(handle, "log_global", &val) == ESP_OK) config->log_level_global = val;
     if (nvs_get_u8(handle, "log_ml", &val) == ESP_OK) config->log_level_microlink = val;
+    if (nvs_get_u16(handle, "ts_boot_s", &val16) == ESP_OK) config->tailscale_boot_delay_s = val16;
+    if (nvs_get_u16(handle, "wifi_rec_s", &val16) == ESP_OK) config->wifi_recovery_cooldown_s = val16;
+    if (nvs_get_u16(handle, "sched_poll_s", &val16) == ESP_OK) config->scheduler_poll_interval_s = val16;
+    len = sizeof(config->ntp_server_1);
+    nvs_get_str(handle, "ntp1", config->ntp_server_1, &len);
+    len = sizeof(config->ntp_server_2);
+    nvs_get_str(handle, "ntp2", config->ntp_server_2, &len);
+    if (nvs_get_u16(handle, "px_buf", &val16) == ESP_OK) config->proxy_buf_size = val16;
+    if (nvs_get_u16(handle, "px_sock_s", &val16) == ESP_OK) config->proxy_socket_timeout_s = val16;
+    if (nvs_get_u16(handle, "px_idle_s", &val16) == ESP_OK) config->proxy_idle_timeout_s = val16;
+    if (nvs_get_u16(handle, "px_acc_ms", &val16) == ESP_OK) config->proxy_accept_retry_ms = val16;
+    if (nvs_get_u8(handle, "px_backlog", &val) == ESP_OK) config->proxy_listen_backlog = val;
+    if (nvs_get_u16(handle, "scan_min_ms", &val16) == ESP_OK) config->scan_active_min_ms = val16;
+    if (nvs_get_u16(handle, "scan_max_ms", &val16) == ESP_OK) config->scan_active_max_ms = val16;
+    if (nvs_get_u16(handle, "scan_to_s", &val16) == ESP_OK) config->scan_timeout_s = val16;
+    if (nvs_get_u8(handle, "ping_count", &val) == ESP_OK) config->ping_count = val;
+    if (nvs_get_u16(handle, "ping_int_ms", &val16) == ESP_OK) config->ping_interval_ms = val16;
+    if (nvs_get_u16(handle, "ping_to_ms", &val16) == ESP_OK) config->ping_timeout_ms = val16;
+    if (nvs_get_u16(handle, "ping_wait_s", &val16) == ESP_OK) config->ping_total_wait_s = val16;
     len = sizeof(config->sched_tz);
     nvs_get_str(handle, "sched_tz", config->sched_tz, &len);
     if (nvs_get_u8(handle, "sched_mode", &val) == ESP_OK) {
         config->sched_mode = (scheduler_mode_t)val;
+    }
+    if (nvs_get_u16(handle, "dorm_ts_try", &val16) == ESP_OK) {
+        config->dormant_time_sync_attempt_s = val16;
+    }
+    if (nvs_get_u32(handle, "dorm_ts_ret", &val32) == ESP_OK) {
+        config->dormant_time_sync_retry_s = val32;
+    }
+    if (nvs_get_u8(handle, "dorm_ap_rec", &val) == ESP_OK) {
+        config->dormant_ap_recovery_enabled = val != 0;
+    }
+    if (nvs_get_u16(handle, "dorm_ap_win", &val16) == ESP_OK) {
+        config->dormant_ap_recovery_window_s = val16;
+    }
+    if (nvs_get_u8(handle, "dorm_btn_en", &val) == ESP_OK) {
+        config->dormant_button_wake_enabled = val != 0;
+    }
+    if (nvs_get_u16(handle, "dorm_btn_s", &val16) == ESP_OK) {
+        config->dormant_button_wake_s = val16;
+    }
+    if (nvs_get_u8(handle, "dorm_ap_off", &val) == ESP_OK) {
+        config->dormant_keep_ap_off_during_active_window = val != 0;
     }
     if (nvs_get_u8(handle, "hid_ka_en", &val) == ESP_OK) {
         config->usb_hid_keepalive_enabled = val != 0;
@@ -285,6 +361,72 @@ esp_err_t config_storage_load(repeater_config_t *config)
     if (config->log_level_microlink > CFG_LOG_LEVEL_VERBOSE) {
         config->log_level_microlink = CFG_LOG_LEVEL_WARN;
     }
+    if (config->tailscale_boot_delay_s > CFG_TS_BOOT_DELAY_MAX_S) {
+        config->tailscale_boot_delay_s = CFG_TS_BOOT_DELAY_DEFAULT_S;
+    }
+    if (config->wifi_recovery_cooldown_s < CFG_WIFI_RECOVERY_COOLDOWN_MIN_S ||
+        config->wifi_recovery_cooldown_s > CFG_WIFI_RECOVERY_COOLDOWN_MAX_S) {
+        config->wifi_recovery_cooldown_s = CFG_WIFI_RECOVERY_COOLDOWN_DEFAULT_S;
+    }
+    if (config->scheduler_poll_interval_s < CFG_SCHED_POLL_INTERVAL_MIN_S ||
+        config->scheduler_poll_interval_s > CFG_SCHED_POLL_INTERVAL_MAX_S) {
+        config->scheduler_poll_interval_s = CFG_SCHED_POLL_INTERVAL_DEFAULT_S;
+    }
+    if (!runtime_string_valid(config->ntp_server_1, sizeof(config->ntp_server_1))) {
+        strlcpy(config->ntp_server_1, CFG_NTP_SERVER_1_DEFAULT, sizeof(config->ntp_server_1));
+    }
+    if (!runtime_string_valid(config->ntp_server_2, sizeof(config->ntp_server_2))) {
+        strlcpy(config->ntp_server_2, CFG_NTP_SERVER_2_DEFAULT, sizeof(config->ntp_server_2));
+    }
+    if (config->proxy_buf_size < CFG_PROXY_BUF_SIZE_MIN ||
+        config->proxy_buf_size > CFG_PROXY_BUF_SIZE_MAX) {
+        config->proxy_buf_size = CFG_PROXY_BUF_SIZE_DEFAULT;
+    }
+    if (config->proxy_socket_timeout_s < CFG_PROXY_SOCKET_TIMEOUT_MIN_S ||
+        config->proxy_socket_timeout_s > CFG_PROXY_SOCKET_TIMEOUT_MAX_S) {
+        config->proxy_socket_timeout_s = CFG_PROXY_SOCKET_TIMEOUT_DEFAULT_S;
+    }
+    if (config->proxy_idle_timeout_s < CFG_PROXY_IDLE_TIMEOUT_MIN_S ||
+        config->proxy_idle_timeout_s > CFG_PROXY_IDLE_TIMEOUT_MAX_S) {
+        config->proxy_idle_timeout_s = CFG_PROXY_IDLE_TIMEOUT_DEFAULT_S;
+    }
+    if (config->proxy_accept_retry_ms < CFG_PROXY_ACCEPT_RETRY_MIN_MS ||
+        config->proxy_accept_retry_ms > CFG_PROXY_ACCEPT_RETRY_MAX_MS) {
+        config->proxy_accept_retry_ms = CFG_PROXY_ACCEPT_RETRY_DEFAULT_MS;
+    }
+    if (config->proxy_listen_backlog < CFG_PROXY_LISTEN_BACKLOG_MIN ||
+        config->proxy_listen_backlog > CFG_PROXY_LISTEN_BACKLOG_MAX) {
+        config->proxy_listen_backlog = CFG_PROXY_LISTEN_BACKLOG_DEFAULT;
+    }
+    if (config->scan_active_min_ms < CFG_SCAN_ACTIVE_MIN_MIN_MS ||
+        config->scan_active_min_ms > CFG_SCAN_ACTIVE_MIN_MAX_MS) {
+        config->scan_active_min_ms = CFG_SCAN_ACTIVE_MIN_DEFAULT_MS;
+    }
+    if (config->scan_active_max_ms < CFG_SCAN_ACTIVE_MAX_MIN_MS ||
+        config->scan_active_max_ms > CFG_SCAN_ACTIVE_MAX_MAX_MS ||
+        config->scan_active_max_ms < config->scan_active_min_ms) {
+        config->scan_active_max_ms = CFG_SCAN_ACTIVE_MAX_DEFAULT_MS;
+    }
+    if (config->scan_timeout_s < CFG_SCAN_TIMEOUT_MIN_S ||
+        config->scan_timeout_s > CFG_SCAN_TIMEOUT_MAX_S) {
+        config->scan_timeout_s = CFG_SCAN_TIMEOUT_DEFAULT_S;
+    }
+    if (config->ping_count < CFG_PING_COUNT_MIN ||
+        config->ping_count > CFG_PING_COUNT_MAX) {
+        config->ping_count = CFG_PING_COUNT_DEFAULT;
+    }
+    if (config->ping_interval_ms < CFG_PING_INTERVAL_MIN_MS ||
+        config->ping_interval_ms > CFG_PING_INTERVAL_MAX_MS) {
+        config->ping_interval_ms = CFG_PING_INTERVAL_DEFAULT_MS;
+    }
+    if (config->ping_timeout_ms < CFG_PING_TIMEOUT_MIN_MS ||
+        config->ping_timeout_ms > CFG_PING_TIMEOUT_MAX_MS) {
+        config->ping_timeout_ms = CFG_PING_TIMEOUT_DEFAULT_MS;
+    }
+    if (config->ping_total_wait_s < CFG_PING_TOTAL_WAIT_MIN_S ||
+        config->ping_total_wait_s > CFG_PING_TOTAL_WAIT_MAX_S) {
+        config->ping_total_wait_s = CFG_PING_TOTAL_WAIT_DEFAULT_S;
+    }
     if (config->sta_retry_max < CFG_STA_RETRY_MIN ||
         config->sta_retry_max > CFG_STA_RETRY_MAX_LIMIT) {
         config->sta_retry_max = CFG_STA_RETRY_DEFAULT;
@@ -311,9 +453,26 @@ esp_err_t config_storage_load(repeater_config_t *config)
     }
     if (config->sched_mode != SCHED_MODE_ALWAYS_ON &&
         config->sched_mode != SCHED_MODE_SCHEDULED &&
-        config->sched_mode != SCHED_MODE_MANUAL_OFF) {
+        config->sched_mode != SCHED_MODE_MANUAL_OFF &&
+        config->sched_mode != SCHED_MODE_DORMANT_SCHEDULED) {
         ESP_LOGW(TAG, "Invalid scheduler mode in NVS, using always-on");
         config->sched_mode = SCHED_MODE_ALWAYS_ON;
+    }
+    if (config->dormant_time_sync_attempt_s < CFG_DORMANT_TIME_SYNC_ATTEMPT_MIN_S ||
+        config->dormant_time_sync_attempt_s > CFG_DORMANT_TIME_SYNC_ATTEMPT_MAX_S) {
+        config->dormant_time_sync_attempt_s = CFG_DORMANT_TIME_SYNC_ATTEMPT_DEFAULT_S;
+    }
+    if (config->dormant_time_sync_retry_s < CFG_DORMANT_TIME_SYNC_RETRY_MIN_S ||
+        config->dormant_time_sync_retry_s > CFG_DORMANT_TIME_SYNC_RETRY_MAX_S) {
+        config->dormant_time_sync_retry_s = CFG_DORMANT_TIME_SYNC_RETRY_DEFAULT_S;
+    }
+    if (config->dormant_ap_recovery_window_s < CFG_DORMANT_AP_RECOVERY_WINDOW_MIN_S ||
+        config->dormant_ap_recovery_window_s > CFG_DORMANT_AP_RECOVERY_WINDOW_MAX_S) {
+        config->dormant_ap_recovery_window_s = CFG_DORMANT_AP_RECOVERY_WINDOW_DEFAULT_S;
+    }
+    if (config->dormant_button_wake_s < CFG_DORMANT_BUTTON_WAKE_MIN_S ||
+        config->dormant_button_wake_s > CFG_DORMANT_BUTTON_WAKE_MAX_S) {
+        config->dormant_button_wake_s = CFG_DORMANT_BUTTON_WAKE_DEFAULT_S;
     }
     if (config->usb_hid_keepalive_interval_s < CFG_USB_HID_KEEPALIVE_INTERVAL_MIN_S ||
         config->usb_hid_keepalive_interval_s > CFG_USB_HID_KEEPALIVE_INTERVAL_MAX_S) {
@@ -391,8 +550,33 @@ esp_err_t config_storage_save(const repeater_config_t *config)
 
     nvs_set_u8(handle, "log_global", config->log_level_global);
     nvs_set_u8(handle, "log_ml", config->log_level_microlink);
+    nvs_set_u16(handle, "ts_boot_s", config->tailscale_boot_delay_s);
+    nvs_set_u16(handle, "wifi_rec_s", config->wifi_recovery_cooldown_s);
+    nvs_set_u16(handle, "sched_poll_s", config->scheduler_poll_interval_s);
+    nvs_set_str(handle, "ntp1", config->ntp_server_1);
+    nvs_set_str(handle, "ntp2", config->ntp_server_2);
+    nvs_set_u16(handle, "px_buf", config->proxy_buf_size);
+    nvs_set_u16(handle, "px_sock_s", config->proxy_socket_timeout_s);
+    nvs_set_u16(handle, "px_idle_s", config->proxy_idle_timeout_s);
+    nvs_set_u16(handle, "px_acc_ms", config->proxy_accept_retry_ms);
+    nvs_set_u8(handle, "px_backlog", config->proxy_listen_backlog);
+    nvs_set_u16(handle, "scan_min_ms", config->scan_active_min_ms);
+    nvs_set_u16(handle, "scan_max_ms", config->scan_active_max_ms);
+    nvs_set_u16(handle, "scan_to_s", config->scan_timeout_s);
+    nvs_set_u8(handle, "ping_count", config->ping_count);
+    nvs_set_u16(handle, "ping_int_ms", config->ping_interval_ms);
+    nvs_set_u16(handle, "ping_to_ms", config->ping_timeout_ms);
+    nvs_set_u16(handle, "ping_wait_s", config->ping_total_wait_s);
     nvs_set_str(handle, "sched_tz", config->sched_tz);
     nvs_set_u8(handle, "sched_mode", (uint8_t)config->sched_mode);
+    nvs_set_u16(handle, "dorm_ts_try", config->dormant_time_sync_attempt_s);
+    nvs_set_u32(handle, "dorm_ts_ret", config->dormant_time_sync_retry_s);
+    nvs_set_u8(handle, "dorm_ap_rec", config->dormant_ap_recovery_enabled ? 1 : 0);
+    nvs_set_u16(handle, "dorm_ap_win", config->dormant_ap_recovery_window_s);
+    nvs_set_u8(handle, "dorm_btn_en", config->dormant_button_wake_enabled ? 1 : 0);
+    nvs_set_u16(handle, "dorm_btn_s", config->dormant_button_wake_s);
+    nvs_set_u8(handle, "dorm_ap_off",
+               config->dormant_keep_ap_off_during_active_window ? 1 : 0);
     nvs_set_u8(handle, "hid_ka_en", config->usb_hid_keepalive_enabled ? 1 : 0);
     nvs_set_u16(handle, "hid_ka_int", config->usb_hid_keepalive_interval_s);
     nvs_set_str(handle, "hid_ka_key", config->usb_hid_keepalive_key);

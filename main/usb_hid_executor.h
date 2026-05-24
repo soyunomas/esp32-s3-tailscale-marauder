@@ -16,8 +16,8 @@ typedef enum {
 typedef struct {
     usb_hid_exec_state_t state;
     bool dry_run;
-    uint16_t current_line;
-    uint16_t total_lines;
+    uint32_t current_line;
+    uint32_t total_lines;
     char macro_name[USB_HID_MACRO_NAME_LEN];
     char message[96];
 } usb_hid_exec_status_t;

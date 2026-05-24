@@ -26,7 +26,8 @@ static void start_proxy_listeners(void);
 static void stop_proxy_listeners(void);
 
 /* TCP Proxy types — defined early so functions below can use them */
-#define PROXY_BUF_SIZE 1460
+#define TCP_PROXY_TASK_STACK_SIZE 4096
+#define TCP_PROXY_TASK_PRIORITY 3
 typedef struct {
     struct sockaddr_in dest;
     int listen_fd;
@@ -62,10 +63,57 @@ typedef enum {
 
 static napt_if_t s_napt_if = NAPT_IF_NONE;
 
-#define WIFI_RECOVERY_COOLDOWN_S 60U
-
 static uint32_t reconnect_backoff_s(void);
 static void schedule_reconnect(uint32_t delay_s);
+
+static wifi_mode_t desired_wifi_mode(void)
+{
+    bool sta_radio = s_sta_scheduler_enabled;
+    if (s_ap_enabled && sta_radio) return WIFI_MODE_APSTA;
+    if (s_ap_enabled) return WIFI_MODE_AP;
+    if (sta_radio) return WIFI_MODE_STA;
+    return WIFI_MODE_NULL;
+}
+
+static esp_err_t apply_wifi_mode(void)
+{
+    wifi_mode_t mode = desired_wifi_mode();
+    esp_err_t ret = esp_wifi_set_mode(mode);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi mode change to %d failed: %s", (int)mode, esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+static uint32_t wifi_recovery_cooldown_s(void)
+{
+    return s_config ? s_config->wifi_recovery_cooldown_s : CFG_WIFI_RECOVERY_COOLDOWN_DEFAULT_S;
+}
+
+static uint16_t proxy_buf_size(void)
+{
+    return s_config ? s_config->proxy_buf_size : CFG_PROXY_BUF_SIZE_DEFAULT;
+}
+
+static uint16_t proxy_socket_timeout_s(void)
+{
+    return s_config ? s_config->proxy_socket_timeout_s : CFG_PROXY_SOCKET_TIMEOUT_DEFAULT_S;
+}
+
+static uint16_t proxy_idle_timeout_s(void)
+{
+    return s_config ? s_config->proxy_idle_timeout_s : CFG_PROXY_IDLE_TIMEOUT_DEFAULT_S;
+}
+
+static uint16_t proxy_accept_retry_ms(void)
+{
+    return s_config ? s_config->proxy_accept_retry_ms : CFG_PROXY_ACCEPT_RETRY_DEFAULT_MS;
+}
+
+static uint8_t proxy_listen_backlog(void)
+{
+    return s_config ? s_config->proxy_listen_backlog : CFG_PROXY_LISTEN_BACKLOG_DEFAULT;
+}
 
 static void apply_netif_hostname(void)
 {
@@ -150,7 +198,7 @@ static void reconnect_timer_cb(TimerHandle_t timer)
     esp_err_t ret = esp_wifi_connect();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(ret));
-        schedule_reconnect(s_sta_recovery ? WIFI_RECOVERY_COOLDOWN_S : reconnect_backoff_s());
+        schedule_reconnect(s_sta_recovery ? wifi_recovery_cooldown_s() : reconnect_backoff_s());
     }
 }
 
@@ -358,7 +406,7 @@ static void proxy_handle_client(int client_fd, const struct sockaddr_in *dest)
         return;
     }
 
-    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = proxy_socket_timeout_s(), .tv_usec = 0 };
     setsockopt(up_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(up_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -370,7 +418,8 @@ static void proxy_handle_client(int client_fd, const struct sockaddr_in *dest)
 
     /* Bidirectional copy: client → upstream, upstream → client */
     int max_fd = (client_fd > up_fd ? client_fd : up_fd) + 1;
-    uint8_t *buf = malloc(PROXY_BUF_SIZE);
+    uint16_t buf_size = proxy_buf_size();
+    uint8_t *buf = malloc(buf_size);
     if (!buf) { close(up_fd); close(client_fd); return; }
 
     while (1) {
@@ -379,18 +428,18 @@ static void proxy_handle_client(int client_fd, const struct sockaddr_in *dest)
         FD_SET(client_fd, &rfds);
         FD_SET(up_fd, &rfds);
 
-        struct timeval sel_tv = { .tv_sec = 30, .tv_usec = 0 };
+        struct timeval sel_tv = { .tv_sec = proxy_idle_timeout_s(), .tv_usec = 0 };
         int ret = select(max_fd, &rfds, NULL, NULL, &sel_tv);
         if (ret <= 0) break;
 
         if (FD_ISSET(client_fd, &rfds)) {
-            int n = read(client_fd, buf, PROXY_BUF_SIZE);
+            int n = read(client_fd, buf, buf_size);
             if (n <= 0) break;
             if (write(up_fd, buf, n) < 0) break;
         }
 
         if (FD_ISSET(up_fd, &rfds)) {
-            int n = read(up_fd, buf, PROXY_BUF_SIZE);
+            int n = read(up_fd, buf, buf_size);
             if (n <= 0) break;
             if (write(client_fd, buf, n) < 0) break;
         }
@@ -411,11 +460,11 @@ static void proxy_listener_task(void *arg)
         socklen_t addr_len = sizeof(client_addr);
         int client_fd = accept(pl->listen_fd, (struct sockaddr *)&client_addr, &addr_len);
         if (client_fd < 0) {
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(proxy_accept_retry_ms()));
             continue;
         }
 
-        struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+        struct timeval tv = { .tv_sec = proxy_socket_timeout_s(), .tv_usec = 0 };
         setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -459,7 +508,7 @@ static void start_proxy_listeners(void)
             continue;
         }
 
-        listen(fd, 3);
+        listen(fd, proxy_listen_backlog());
 
         s_proxy_listeners[i].listen_fd = fd;
         s_proxy_listeners[i].dest.sin_family = AF_INET;
@@ -473,8 +522,9 @@ static void start_proxy_listeners(void)
                  s_config->port_fwd[i].ext_port, ip_str,
                  s_config->port_fwd[i].int_port);
 
-        xTaskCreate(proxy_listener_task, "tcp_proxy", 4096,
-                    (void *)(intptr_t)i, 3, &s_proxy_listeners[i].task);
+        xTaskCreate(proxy_listener_task, "tcp_proxy", TCP_PROXY_TASK_STACK_SIZE,
+                    (void *)(intptr_t)i, TCP_PROXY_TASK_PRIORITY,
+                    &s_proxy_listeners[i].task);
     }
 }
 
@@ -536,9 +586,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
             if (s_config->sta_retry_max > 0 && s_retry_count >= s_config->sta_retry_max) {
                 s_sta_recovery = true;
-                ESP_LOGW(TAG, "STA recovery mode: retry_count=%u cooldown=%u s",
-                         s_retry_count, WIFI_RECOVERY_COOLDOWN_S);
-                schedule_reconnect(WIFI_RECOVERY_COOLDOWN_S);
+                uint32_t cooldown_s = wifi_recovery_cooldown_s();
+                ESP_LOGW(TAG, "STA recovery mode: retry_count=%u cooldown=%lu s",
+                         s_retry_count, (unsigned long)cooldown_s);
+                schedule_reconnect(cooldown_s);
             } else {
                 s_sta_recovery = false;
                 schedule_reconnect(reconnect_backoff_s());
@@ -737,7 +788,7 @@ esp_err_t wifi_manager_start(void)
 
     configure_sta();
     configure_ap();
-    ESP_ERROR_CHECK(esp_wifi_set_mode(s_ap_enabled ? WIFI_MODE_APSTA : WIFI_MODE_STA));
+    ESP_ERROR_CHECK(apply_wifi_mode());
 
     ESP_ERROR_CHECK(esp_wifi_start());
     s_wifi_started = true;
@@ -777,7 +828,7 @@ esp_err_t wifi_manager_reconfigure(repeater_config_t *config)
         }
         configure_sta();
         configure_ap();
-        ESP_ERROR_CHECK(esp_wifi_set_mode(s_ap_enabled ? WIFI_MODE_APSTA : WIFI_MODE_STA));
+        ESP_ERROR_CHECK(apply_wifi_mode());
         ESP_ERROR_CHECK(esp_wifi_start());
         s_wifi_started = true;
         s_reconfiguring = false;
@@ -805,8 +856,8 @@ esp_err_t wifi_manager_scan(wifi_ap_record_t *ap_records, uint16_t *ap_count)
     wifi_scan_config_t scan_cfg = {
         .show_hidden = true,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = 100,
-        .scan_time.active.max = 300,
+        .scan_time.active.min = s_config ? s_config->scan_active_min_ms : CFG_SCAN_ACTIVE_MIN_DEFAULT_MS,
+        .scan_time.active.max = s_config ? s_config->scan_active_max_ms : CFG_SCAN_ACTIVE_MAX_DEFAULT_MS,
     };
 
     esp_err_t ret = esp_wifi_scan_start(&scan_cfg, false);
@@ -817,7 +868,8 @@ esp_err_t wifi_manager_scan(wifi_ap_record_t *ap_records, uint16_t *ap_count)
         return ret;
     }
 
-    if (xSemaphoreTake(s_scan_done, pdMS_TO_TICKS(10000)) != pdTRUE) {
+    uint16_t scan_timeout_s = s_config ? s_config->scan_timeout_s : CFG_SCAN_TIMEOUT_DEFAULT_S;
+    if (xSemaphoreTake(s_scan_done, pdMS_TO_TICKS(scan_timeout_s * 1000U)) != pdTRUE) {
         ESP_LOGE(TAG, "Scan timeout");
         esp_wifi_scan_stop();
         s_scanning = false;
@@ -906,12 +958,18 @@ esp_err_t wifi_manager_set_sta_scheduler_enabled(bool enabled)
                 ESP_LOGW(TAG, "Scheduled STA disable disconnect failed: %s", esp_err_to_name(ret));
                 return ret;
             }
+            ret = apply_wifi_mode();
+            if (ret != ESP_OK) return ret;
         }
         ESP_LOGI(TAG, "STA disabled by scheduler");
         return ESP_OK;
     }
 
     s_retry_count = 0;
+    if (s_wifi_started) {
+        esp_err_t ret = apply_wifi_mode();
+        if (ret != ESP_OK) return ret;
+    }
     if (s_wifi_started && !s_sta_paused && s_config &&
         s_config->sta_ssid[0] != '\0' && !s_status.sta_connected) {
         schedule_reconnect(1);
@@ -938,9 +996,9 @@ esp_err_t wifi_manager_set_ap_enabled(bool enabled)
     esp_err_t ret;
     if (enabled) {
         configure_ap();
-        ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+        ret = apply_wifi_mode();
     } else {
-        ret = esp_wifi_set_mode(WIFI_MODE_STA);
+        ret = apply_wifi_mode();
     }
 
     if (ret != ESP_OK) {
@@ -1017,9 +1075,9 @@ esp_err_t wifi_manager_ping(const char *target, ping_result_t *result)
 
     esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
     ping_config.target_addr = target_addr;
-    ping_config.count = 3;
-    ping_config.interval_ms = 500;
-    ping_config.timeout_ms = 2000;
+    ping_config.count = s_config ? s_config->ping_count : CFG_PING_COUNT_DEFAULT;
+    ping_config.interval_ms = s_config ? s_config->ping_interval_ms : CFG_PING_INTERVAL_DEFAULT_MS;
+    ping_config.timeout_ms = s_config ? s_config->ping_timeout_ms : CFG_PING_TIMEOUT_DEFAULT_MS;
     ping_config.task_stack_size = 4096;
 
     esp_ping_callbacks_t cbs = {
@@ -1039,8 +1097,8 @@ esp_err_t wifi_manager_ping(const char *target, ping_result_t *result)
 
     esp_ping_start(hdl);
 
-    // Wait for ping to finish (3 pings * 2.5s max each = 7.5s worst case)
-    if (xSemaphoreTake(s_ping_done, pdMS_TO_TICKS(10000)) != pdTRUE) {
+    uint16_t ping_total_wait_s = s_config ? s_config->ping_total_wait_s : CFG_PING_TOTAL_WAIT_DEFAULT_S;
+    if (xSemaphoreTake(s_ping_done, pdMS_TO_TICKS(ping_total_wait_s * 1000U)) != pdTRUE) {
         ESP_LOGE(TAG, "Ping timeout");
         esp_ping_stop(hdl);
         esp_ping_delete_session(hdl);
