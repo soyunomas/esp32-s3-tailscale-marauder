@@ -19,3 +19,8 @@ idf_component_register(
         spiffs
     EMBED_FILES "embedded_files/index.html" "embedded_files/styles.css" "embedded_files/app.js" "embedded_files/usb_hid.js"
 )
+
+idf_component_get_property(lwip_lib lwip COMPONENT_LIB)
+target_compile_options(${lwip_lib} PRIVATE "-I${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(${lwip_lib} PRIVATE "-DESP_IDF_LWIP_HOOK_FILENAME=\"wifi_lwip_hooks.h\""
+                                                "-DLWIP_HOOK_IP4_INPUT=wifi_manager_lwip_hook_ip4_input")

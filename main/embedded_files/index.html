@@ -370,6 +370,12 @@
       <div class="ts-options">
         <label class="toggle-label toggle-sm"><input type="checkbox" id="tsExposeLan"> Expose LAN over Tailscale</label>
       </div>
+      <div class="ts-options">
+        <label class="toggle-label toggle-sm"><input type="checkbox" id="tsExposeWebUi"> Hide Web UI on STA/LAN IP</label>
+      </div>
+      <div class="notice warning" id="tsWebUiWarning" style="display:none">
+        The web UI and configured forwarded ports are blocked on the upstream WiFi IP. Use the Tailscale IP or the device AP for recovery.
+      </div>
       <div class="form-group" id="tsCidrGroup" style="display:none">
         <label for="tsAdvertiseCidr">Subnet CIDR</label>
         <input type="text" id="tsAdvertiseCidr" placeholder="192.168.1.0/24" maxlength="95" autocomplete="off">

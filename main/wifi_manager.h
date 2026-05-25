@@ -5,6 +5,8 @@
 #include "esp_netif.h"
 #include "config_storage.h"
 #include "dns_server.h"
+#include "lwip/netif.h"
+#include "lwip/pbuf.h"
 
 #define WIFI_SCAN_MAX_AP 20
 
@@ -44,3 +46,4 @@ typedef struct {
 } ping_result_t;
 
 esp_err_t wifi_manager_ping(const char *target, ping_result_t *result);
+int wifi_manager_lwip_hook_ip4_input(struct pbuf *pbuf, struct netif *input_netif);

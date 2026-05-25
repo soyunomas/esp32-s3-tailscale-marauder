@@ -7,11 +7,14 @@
 #include "esp_check.h"
 #include "esp_eap_client.h"
 #include "esp_netif.h"
+#include "esp_netif_net_stack.h"
 #include "esp_mac.h"
 #include "lwip/lwip_napt.h"
 #include "lwip/inet.h"
 #include "lwip/dns.h"
 #include "lwip/netdb.h"
+#include "lwip/netif.h"
+#include "lwip/pbuf.h"
 #include "lwip/sockets.h"
 #include "ping/ping_sock.h"
 #include "tailscale_manager.h"
@@ -55,6 +58,7 @@ static TimerHandle_t s_reconnect_timer = NULL;
 static bool s_subnet_routing = false;
 static SemaphoreHandle_t s_scan_done = NULL;
 static dns_server_handle_t s_dns_handle = NULL;
+static netif_input_fn s_sta_original_input = NULL;
 
 typedef enum {
     NAPT_IF_NONE = 0,
@@ -113,6 +117,121 @@ static uint16_t proxy_accept_retry_ms(void)
 static uint8_t proxy_listen_backlog(void)
 {
     return s_config ? s_config->proxy_listen_backlog : CFG_PROXY_LISTEN_BACKLOG_DEFAULT;
+}
+
+static bool sta_lan_port_hidden(uint8_t proto, uint16_t dst_port)
+{
+    if (!s_config || !s_config->tailscale.expose_web_ui) return false;
+
+    if (proto == 6 && dst_port == 80) {
+        return true;
+    }
+
+    for (int i = 0; i < CFG_PORT_FWD_MAX; i++) {
+        const port_fwd_rule_t *rule = &s_config->port_fwd[i];
+        if (!rule->enabled || rule->ext_port == 0) continue;
+
+        uint8_t rule_proto = rule->proto == 1 ? 17 : 6;
+        if (proto == rule_proto && dst_port == rule->ext_port) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool sta_lan_filter_should_drop(struct pbuf *p, struct netif *inp)
+{
+    if (!p || !inp || !s_config || !s_config->tailscale.expose_web_ui) return false;
+    if (p->tot_len < 24) return false;
+
+    uint8_t hdr[64];
+    uint16_t l3_offset = 0;
+    if (pbuf_copy_partial(p, hdr, 1, 0) != 1) return false;
+    if ((hdr[0] >> 4) != 4) {
+        if (p->tot_len < 14 || pbuf_copy_partial(p, hdr, 18, 0) < 14) return false;
+        uint16_t eth_type = ((uint16_t)hdr[12] << 8) | hdr[13];
+        l3_offset = 14;
+        if (eth_type == 0x8100 || eth_type == 0x88a8) {
+            if (p->tot_len < 18) return false;
+            eth_type = ((uint16_t)hdr[16] << 8) | hdr[17];
+            l3_offset = 18;
+        }
+        if (eth_type != 0x0800) return false;
+    }
+
+    if (p->tot_len < l3_offset + 24) return false;
+    if (pbuf_copy_partial(p, hdr, 20, l3_offset) != 20) return false;
+
+    if ((hdr[0] >> 4) != 4) return false;
+    uint8_t ihl = (hdr[0] & 0x0f) * 4;
+    if (ihl < 20 || ihl + 4 > sizeof(hdr) || p->tot_len < l3_offset + ihl + 4) return false;
+
+    uint16_t frag = ((uint16_t)hdr[6] << 8) | hdr[7];
+    if ((frag & 0x1fff) != 0) return false;
+
+    uint8_t proto = hdr[9];
+    if (proto != 6 && proto != 17) return false;
+
+    const ip4_addr_t *sta_ip = netif_ip4_addr(inp);
+    if (!sta_ip || ip4_addr_isany_val(*sta_ip)) return false;
+    if (memcmp(&hdr[16], &sta_ip->addr, sizeof(sta_ip->addr)) != 0) return false;
+
+    if (pbuf_copy_partial(p, hdr, ihl + 4, l3_offset) != ihl + 4) return false;
+    uint16_t dst_port = ((uint16_t)hdr[ihl + 2] << 8) | hdr[ihl + 3];
+    return sta_lan_port_hidden(proto, dst_port);
+}
+
+static err_t sta_lan_filter_input(struct pbuf *p, struct netif *inp)
+{
+    if (sta_lan_filter_should_drop(p, inp)) {
+        pbuf_free(p);
+        return ERR_OK;
+    }
+
+    if (s_sta_original_input) {
+        return s_sta_original_input(p, inp);
+    }
+
+    pbuf_free(p);
+    return ERR_IF;
+}
+
+static esp_err_t install_sta_lan_filter_cb(void *ctx)
+{
+    esp_netif_t *esp_netif = (esp_netif_t *)ctx;
+    struct netif *lwip_netif = esp_netif ? (struct netif *)esp_netif_get_netif_impl(esp_netif) : NULL;
+    if (!lwip_netif) return ESP_ERR_INVALID_STATE;
+
+    if (lwip_netif->input != sta_lan_filter_input) {
+        s_sta_original_input = lwip_netif->input;
+        lwip_netif->input = sta_lan_filter_input;
+    }
+    return ESP_OK;
+}
+
+static void install_sta_lan_filter(void)
+{
+    esp_err_t ret = esp_netif_tcpip_exec(install_sta_lan_filter_cb, s_sta_netif);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "STA LAN web exposure filter not installed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "STA LAN web exposure filter installed");
+    }
+}
+
+int wifi_manager_lwip_hook_ip4_input(struct pbuf *pbuf, struct netif *input_netif)
+{
+    if (!s_sta_netif || !pbuf || !input_netif) return 0;
+
+    struct netif *sta_netif = (struct netif *)esp_netif_get_netif_impl(s_sta_netif);
+    if (input_netif != sta_netif) return 0;
+
+    if (sta_lan_filter_should_drop(pbuf, input_netif)) {
+        pbuf_free(pbuf);
+        return 1;
+    }
+    return 0;
 }
 
 static void apply_netif_hostname(void)
@@ -671,6 +790,7 @@ esp_err_t wifi_manager_init(repeater_config_t *config)
     s_sta_netif = esp_netif_create_default_wifi_sta();
     s_ap_netif = esp_netif_create_default_wifi_ap();
     apply_netif_hostname();
+    install_sta_lan_filter();
 
     // Configure DHCP server to offer DNS before it starts (avoids restart later)
     uint8_t dhcps_offer_option = DHCPS_OFFER_DNS;
@@ -689,6 +809,7 @@ esp_err_t wifi_manager_init(repeater_config_t *config)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    install_sta_lan_filter();
 
     return ESP_OK;
 }
@@ -791,6 +912,7 @@ esp_err_t wifi_manager_start(void)
     ESP_ERROR_CHECK(apply_wifi_mode());
 
     ESP_ERROR_CHECK(esp_wifi_start());
+    install_sta_lan_filter();
     s_wifi_started = true;
     if (!s_sta_paused && s_sta_scheduler_enabled && s_config->sta_ssid[0] != '\0') {
         schedule_reconnect(1);
@@ -830,6 +952,7 @@ esp_err_t wifi_manager_reconfigure(repeater_config_t *config)
         configure_ap();
         ESP_ERROR_CHECK(apply_wifi_mode());
         ESP_ERROR_CHECK(esp_wifi_start());
+        install_sta_lan_filter();
         s_wifi_started = true;
         s_reconfiguring = false;
         if (!s_sta_paused && s_sta_scheduler_enabled && s_config->sta_ssid[0] != '\0') {

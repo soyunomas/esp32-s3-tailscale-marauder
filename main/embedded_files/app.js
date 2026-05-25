@@ -79,6 +79,10 @@
     updateSubnetModeUI();
   });
 
+  document.getElementById('tsExposeWebUi').addEventListener('change',function(){
+    updateWebUiExposureWarning();
+  });
+
   document.getElementById('tsSubnetMode').addEventListener('change',function(){
     updateSubnetModeUI();
   });
@@ -95,6 +99,11 @@
 
   function getSubnetMode(){
     return document.getElementById('tsExposeLan').checked?NET_MODE_TS_GATEWAY:NET_MODE_REPEATER;
+  }
+
+  function updateWebUiExposureWarning(){
+    var warn=document.getElementById('tsWebUiWarning');
+    if(warn) warn.style.display=document.getElementById('tsExposeWebUi').checked?'block':'none';
   }
 
   function updateSubnetModeUI(){
@@ -339,6 +348,7 @@
       document.getElementById('tsMaxPeers').value=cfg.max_peers||8;
       var exposeLan=!!cfg.expose_lan;
       document.getElementById('tsExposeLan').checked=exposeLan;
+      document.getElementById('tsExposeWebUi').checked=!!cfg.expose_web_ui;
       document.getElementById('tsCidrGroup').style.display=exposeLan?'block':'none';
       document.getElementById('tsSubnetMode').value=exposeLan?NET_MODE_TS_GATEWAY:NET_MODE_REPEATER;
       var savedCidr=cfg.advertise_cidr||'';
@@ -351,6 +361,7 @@
         document.getElementById('tsAdvertiseCidr').value=savedCidr;
       }
       document.getElementById('tsAdvertisedRoute').value=exposeLan?(savedCidr||'--'):'--';
+      updateWebUiExposureWarning();
       updateSubnetModeUI();
     }).catch(function(){});
   }
@@ -371,6 +382,7 @@
         enable_disco:document.getElementById('tsDisco').checked,
         enable_stun:document.getElementById('tsStun').checked,
         max_peers:maxPeers,
+        expose_web_ui:document.getElementById('tsExposeWebUi').checked,
         expose_lan:document.getElementById('tsExposeLan').checked,
         net_mode:mode,
         advertise_cidr:document.getElementById('tsAdvertiseCidr').value.trim()||deriveStaCidr()||'192.168.24.0/24'
