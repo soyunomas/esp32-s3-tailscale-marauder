@@ -305,6 +305,7 @@ rule should only control AP / STA / Tailscale state.
 | **Status** | Current runtime state. |
 | **DERP / DISCO / STUN** | Enables relay, peer discovery, and NAT traversal features. |
 | **Expose LAN over Tailscale** | Advertises a LAN subnet over Tailscale. This forces Gateway/SNAT behavior. |
+| **Hide Web UI on STA/LAN IP** | Drops inbound traffic to the web UI and configured forwarded ports when addressed to the upstream WiFi/STA IP. Tailscale and the device AP remain usable. This does not hide the device from ARP while STA is connected. |
 | **Subnet CIDR** | IPv4 subnet to advertise, such as `192.168.1.0/24`. |
 | **Advertised Route / Route State** | Read-only route advertisement status. |
 | **Network Behavior** | Shows Repeater or Tailscale Gateway/SNAT mode. Gateway/SNAT disables AP repeater NAPT and port forwarding to AP clients. |

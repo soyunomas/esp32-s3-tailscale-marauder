@@ -295,6 +295,7 @@ Tailscale.
 | **Status** | Estado runtime actual. |
 | **DERP / DISCO / STUN** | Activa relay, descubrimiento de peers y traversal NAT. |
 | **Expose LAN over Tailscale** | Anuncia una subred LAN por Tailscale. Fuerza Gateway/SNAT. |
+| **Hide Web UI on STA/LAN IP** | Descarta el tráfico entrante hacia la web y los puertos redirigidos configurados cuando va dirigido a la IP WiFi/STA. Tailscale y el AP del dispositivo siguen disponibles. Esto no oculta el dispositivo frente a ARP mientras STA esté conectado. |
 | **Subnet CIDR** | Subred IPv4 anunciada, por ejemplo `192.168.1.0/24`. |
 | **Advertised Route / Route State** | Estado de anuncio de ruta, solo lectura. |
 | **Network Behavior** | Muestra Repeater o Tailscale Gateway/SNAT. Gateway/SNAT desactiva NAPT del AP y port forwarding a clientes AP. |
